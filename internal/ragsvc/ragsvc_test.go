@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/costa92/llm-agent-contract/llm"
+	raggraph "github.com/costa92/llm-agent-rag/graph"
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
 	ragpostgres "github.com/costa92/llm-agent-rag/postgres"
 	ragcore "github.com/costa92/llm-agent-rag/rag"
@@ -125,4 +126,49 @@ func TestAskReturnsHitsOnLivePgvector(t *testing.T) {
 	if ans.Diagnostics.HitCount == 0 && len(ans.Citations) == 0 {
 		t.Fatalf("Ask returned no hits/citations (HitCount=%d, citations=%d) — Namespace isolation broken or SecurityFilters regression", ans.Diagnostics.HitCount, len(ans.Citations))
 	}
+}
+
+// TestGraphComponentsWiredImport proves New passes the graph components into
+// rag.Options so Import drives the auto-extract/auto-detect path without error.
+// Uses the DETERMINISTIC DictionaryEntityExtractor + LouvainDetector + a fixed
+// summarizer — NO scripted-LLM cursor counting (rag's own community_test.go
+// pattern). The in-memory rag store implements CommunityStore, so Import's
+// detection block runs; community READS (ListCommunities) go through the held
+// postgres.Store, so they are asserted in the gated Task 4, not here.
+func TestGraphComponentsWiredImport(t *testing.T) {
+	model := llm.NewScriptedLLM(llm.WithResponses(llm.TextResponse("unused")))
+	embedder := llm.NewScriptedLLM(llm.WithEmbedDimensions(8))
+	svc := New(Deps{
+		Model: model, Embedder: embedder,
+		EntityExtractor: raggraph.DictionaryEntityExtractor{Terms: map[string]string{
+			"alpha": "topic", "bravo": "topic", "carbon": "topic", "delta": "topic",
+		}},
+		CommunityDetector:   raggraph.LouvainDetector{},
+		CommunitySummarizer: fixedSummarizer{},
+	})
+	ctx := context.Background()
+	docs := []ragingest.Document{
+		{ID: "d1", SourceID: "d1", Title: "T1", Content: "alpha bravo alpha bravo"},
+		{ID: "d2", SourceID: "d2", Title: "T2", Content: "carbon delta carbon delta"},
+	}
+	// Import must succeed with the graph seams attached (auto-extract +
+	// auto-detect run internally against the in-memory store; summarization is
+	// lazy so the scripted model's "unused" response is never consumed).
+	if _, err := svc.Import(ctx, docs, ragingest.ImportOptions{Namespace: "ns", ReplaceSource: true}); err != nil {
+		t.Fatalf("Import with graph components wired: %v", err)
+	}
+}
+
+// fixedSummarizer is a deterministic CommunitySummarizer (mirrors rag's
+// staticSummarizer) so reports are reproducible without an LLM cursor. Reused
+// by Task 4's gated live-pgvector test.
+type fixedSummarizer struct{}
+
+func (fixedSummarizer) Summarize(_ context.Context, c raggraph.Community, _ raggraph.Graph) (raggraph.CommunityReport, error) {
+	return raggraph.CommunityReport{
+		CommunityID: c.ID,
+		Title:       "Theme " + c.ID,
+		Summary:     "Summary of community " + c.ID,
+		ContentHash: raggraph.CommunityContentHash(c),
+	}, nil
 }

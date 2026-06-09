@@ -6,6 +6,7 @@ import (
 
 	"github.com/costa92/llm-agent-contract/llm"
 	"github.com/costa92/llm-agent-otel/otelrag"
+	raggraph "github.com/costa92/llm-agent-rag/graph"
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
 	ragpostgres "github.com/costa92/llm-agent-rag/postgres"
 	ragcore "github.com/costa92/llm-agent-rag/rag"
@@ -92,6 +93,14 @@ type Deps struct {
 	RagStore   ragstore.Store       // backing store for rag.New (the postgres.Store)
 	ChunkStore *ragpostgres.Store   // same store, concrete, for List/Remove delete ops
 	Tracer     trace.TracerProvider // optional; nil → no-op spans
+
+	// M3 GraphRAG seams (spec §6 step 4). Nil leaves the path disabled —
+	// Import skips extraction/detection gracefully (rag/import.go:201). Tests
+	// inject deterministic substitutes; production injects LLM-backed ones.
+	EntityExtractor     raggraph.EntityExtractor
+	EntityResolver      raggraph.EntityResolver // optional near-dup merge; nil → rag NoopEntityResolver
+	CommunityDetector   raggraph.CommunityDetector
+	CommunitySummarizer raggraph.CommunitySummarizer
 }
 
 // Service is the only unit that holds the rag backend.
@@ -104,9 +113,13 @@ type Service struct {
 // New wires the adapters, rag.System, and the otelrag wrapper.
 func New(d Deps) *Service {
 	sys := ragcore.New(ragcore.Options{
-		Model:    ragModelAdapter{inner: d.Model},
-		Embedder: ragEmbedderAdapter{inner: d.Embedder},
-		Store:    d.RagStore, // nil → rag default in-memory store (unit tests)
+		Model:               ragModelAdapter{inner: d.Model},
+		Embedder:            ragEmbedderAdapter{inner: d.Embedder},
+		Store:               d.RagStore, // nil → rag default in-memory store (unit tests)
+		EntityExtractor:     d.EntityExtractor,
+		EntityResolver:      d.EntityResolver, // nil → rag defaults to NoopEntityResolver
+		CommunityDetector:   d.CommunityDetector,
+		CommunitySummarizer: d.CommunitySummarizer,
 	})
 	var wrapper *otelrag.Wrapper
 	if d.Tracer != nil {
