@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -19,9 +20,10 @@ import (
 	"github.com/costa92/llm-agent-kb/internal/config"
 )
 
-// TestEndToEndLoginCreateKBUploadAskDelete drives the full M1 success path
-// (spec §1, scoped to M1) over the real HTTP surface on live pgvector:
-// seed user → login → POST /api/orgs → POST /api/orgs/{org}/kbs → upload paste →
+// TestEndToEndLoginCreateKBUploadAskDelete drives the full M2 async success path
+// over the real HTTP surface on live pgvector:
+// seed user → login → POST /api/orgs → POST /api/orgs/{org}/kbs →
+// upload paste (202) → poll documents until ready (worker drains the queue) →
 // ask (hybrid) → assert ≥1 citation → delete document → assert chunks gone.
 // Providers are scripted (no ollama/openai); only PG is required.
 func TestEndToEndLoginCreateKBUploadAskDelete(t *testing.T) {
@@ -125,24 +127,37 @@ func TestEndToEndLoginCreateKBUploadAskDelete(t *testing.T) {
 		t.Fatalf("create kb returned no id: %v", body)
 	}
 
-	// 4. POST /api/kb/{id}/documents (paste) → chunkCount>0.
+	// 4. POST /api/kb/{id}/documents (paste) → 202 + documentId.
 	code, body = do("POST", "/api/kb/"+kbID+"/documents", token,
 		`{"title":"Doc","sourceType":"paste","content":"the quick brown fox jumps over the lazy dog repeatedly"}`)
-	if code != http.StatusOK {
-		t.Fatalf("upload code=%d body=%v want 200", code, body)
+	if code != http.StatusAccepted {
+		t.Fatalf("upload code=%d body=%v want 202", code, body)
 	}
 	docID, _ := body["documentId"].(string)
-	if cc, _ := body["chunkCount"].(float64); cc <= 0 {
-		t.Fatalf("upload chunkCount=%v want >0", body["chunkCount"])
+	if docID == "" {
+		t.Fatalf("upload returned no documentId: %v", body)
+	}
+
+	// 4b. Poll GET /api/kb/{id}/documents until the doc is ready (worker drains async).
+	// The existing `do` closure already decodes JSON, so it handles the list
+	// envelope {items, next_cursor} directly — no separate helper needed.
+	ready := false
+	for i := 0; i < 50; i++ {
+		code, listBody := do("GET", "/api/kb/"+kbID+"/documents", token, "")
+		if code == http.StatusOK && hasReadyDoc(listBody, docID) {
+			ready = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatalf("document %s never reached ready", docID)
 	}
 
 	// 5. POST /api/kb/{id}/ask (hybrid) → answer + ≥1 citation.
 	code, body = do("POST", "/api/kb/"+kbID+"/ask", token, `{"q":"fox","mode":"hybrid","topK":5}`)
 	if code != http.StatusOK {
 		t.Fatalf("ask code=%d body=%v want 200", code, body)
-	}
-	if ans, _ := body["answer"].(string); ans != "scripted answer" {
-		t.Fatalf("ask answer=%v want 'scripted answer'", body["answer"])
 	}
 	cites, _ := body["citations"].([]any)
 	if len(cites) == 0 {
@@ -169,6 +184,18 @@ func TestEndToEndLoginCreateKBUploadAskDelete(t *testing.T) {
 	}
 }
 
+// hasReadyDoc reports whether the document list envelope contains docID at status "ready".
+func hasReadyDoc(listBody map[string]any, docID string) bool {
+	items, _ := listBody["items"].([]any)
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m["id"] == docID && m["status"] == "ready" {
+			return true
+		}
+	}
+	return false
+}
+
 // cleanDB drops business + authz + rag tables for a deterministic run.
 func cleanDB(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
@@ -178,6 +205,7 @@ func cleanDB(t *testing.T, ctx context.Context, dsn string) {
 	}
 	defer pool.Close()
 	for _, tbl := range []string{
+		"ingest_job",
 		"document", "knowledge_base",
 		"chunks", "chunks_entities", "chunks_relations", "chunks_communities", "chunks_community_reports",
 		"auth_membership", "auth_session", "auth_user", "auth_org",

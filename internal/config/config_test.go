@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadDefaults(t *testing.T) {
 	cfg, err := LoadFromLookup(func(string) (string, bool) { return "", false })
@@ -21,6 +24,36 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.MaxRequestsPerUserPerMinute != 30 {
 		t.Fatalf("MaxRequestsPerUserPerMinute=%d want 30", cfg.MaxRequestsPerUserPerMinute)
+	}
+	if cfg.IngestWorkers != 2 {
+		t.Fatalf("IngestWorkers=%d want 2", cfg.IngestWorkers)
+	}
+	if cfg.IngestPollInterval != 2*time.Second {
+		t.Fatalf("IngestPollInterval=%v want 2s", cfg.IngestPollInterval)
+	}
+	if cfg.IngestLease != 60*time.Second {
+		t.Fatalf("IngestLease=%v want 60s", cfg.IngestLease)
+	}
+	if cfg.IngestMaxAttempts != 5 {
+		t.Fatalf("IngestMaxAttempts=%d want 5", cfg.IngestMaxAttempts)
+	}
+	if cfg.IngestBaseBackoff != 5*time.Second {
+		t.Fatalf("IngestBaseBackoff=%v want 5s", cfg.IngestBaseBackoff)
+	}
+	if cfg.MaxUploadBytes != 10<<20 {
+		t.Fatalf("MaxUploadBytes=%d want 10MiB", cfg.MaxUploadBytes)
+	}
+	if cfg.KBStorageQuotaBytes != 256<<20 {
+		t.Fatalf("KBStorageQuotaBytes=%d want 256MiB", cfg.KBStorageQuotaBytes)
+	}
+	if cfg.ParseTimeout != 30*time.Second {
+		t.Fatalf("ParseTimeout=%v want 30s", cfg.ParseTimeout)
+	}
+	if cfg.FetchTimeout != 15*time.Second {
+		t.Fatalf("FetchTimeout=%v want 15s", cfg.FetchTimeout)
+	}
+	if cfg.FetchMaxBytes != 10<<20 {
+		t.Fatalf("FetchMaxBytes=%d want 10MiB", cfg.FetchMaxBytes)
 	}
 }
 

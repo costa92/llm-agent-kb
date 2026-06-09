@@ -29,12 +29,29 @@ type OrgLookup interface {
 }
 
 // Ingester is the document-ingest surface (satisfied by *ingest.Service).
-// DeleteAllDocumentsForKB runs the §16.4 cascade over every doc in a kb and is
-// used by the delete-kb handler before the kb row + memberships are removed.
+// Enqueue is the M2 async upload path (202 + documentId); the worker drains the
+// queue. DeleteAllDocumentsForKB runs the §16.4 cascade over every doc in a kb
+// and is used by the delete-kb handler before the kb row + memberships are
+// removed. ListDocuments/KBContentBytes/Retry back the M2 document endpoints.
 type Ingester interface {
-	Ingest(ctx context.Context, in ingest.IngestInput) (ingest.Result, error)
+	Enqueue(ctx context.Context, in ingest.IngestInput) (string, error)
 	DeleteDocument(ctx context.Context, namespace, documentID string) error
 	DeleteAllDocumentsForKB(ctx context.Context, namespace, kbID string) error
+	ListDocuments(ctx context.Context, kbID string, limit int, cursor string) ([]ingest.DocumentView, string, error)
+	KBContentBytes(ctx context.Context, kbID string) (int64, error)
+	Retry(ctx context.Context, kbID, docID string) error
+}
+
+// kbGetter is the slice of *orgkb.Repo the document handlers need (just Get).
+// Narrowing to an interface lets the handler tests inject a DB-free fake.
+type kbGetter interface {
+	Get(ctx context.Context, id string) (orgkb.KB, error)
+}
+
+// DocStatusReader reads a document's status+phase for progress streaming
+// (satisfied by *ingest.Service).
+type DocStatusReader interface {
+	DocumentStatus(ctx context.Context, kbID, docID string) (status, phase string, chunkCount int, errMsg string, err error)
 }
 
 // Deps are the dependencies NewMux wires together.
@@ -47,6 +64,10 @@ type Deps struct {
 	Ingester     Ingester
 	KBRepo       *orgkb.Repo // used by kb CRUD handlers; nil in focused unit tests
 	PerUserLimit int
+
+	MaxUploadBytes      int64           // http.MaxBytesReader cap per document body
+	KBStorageQuotaBytes int64           // per-kb cumulative content-byte quota (§16.3)
+	DocStatus           DocStatusReader // reads document status for SSE; satisfied by *ingest.Service
 }
 
 // kbScopeFromRequest builds the ScopeFromRequest closure for kb-scoped routes
@@ -111,7 +132,10 @@ func NewMux(d Deps) *http.ServeMux {
 	mux.Handle("POST /api/kb/{id}/ask", chain(authzrole.RoleViewer, askHandler(d.Asker)))
 	// Documents — upload requires editor+, read viewer+, delete editor+.
 	if d.Ingester != nil && d.KBRepo != nil {
-		mux.Handle("POST /api/kb/{id}/documents", chain(authzrole.RoleEditor, uploadHandler(d.KBRepo, d.Ingester)))
+		mux.Handle("POST /api/kb/{id}/documents", chain(authzrole.RoleEditor, uploadHandler(d.KBRepo, d.Ingester, d.MaxUploadBytes, d.KBStorageQuotaBytes)))
+		mux.Handle("GET /api/kb/{id}/documents", chain(authzrole.RoleViewer, listDocsHandler(d.KBRepo, d.Ingester)))
+		mux.Handle("GET /api/kb/{id}/documents/{docId}/progress", chain(authzrole.RoleViewer, progressHandler(d.KBRepo, d.DocStatus)))
+		mux.Handle("POST /api/kb/{id}/documents/{docId}/retry", chain(authzrole.RoleEditor, retryHandler(d.KBRepo, d.Ingester)))
 		mux.Handle("DELETE /api/kb/{id}/documents/{docId}", chain(authzrole.RoleEditor, deleteDocHandler(d.KBRepo, d.Ingester)))
 		// kb resource — delete is admin (cascade wired in deleteKBHandler).
 		mux.Handle("GET /api/kb/{id}", chain(authzrole.RoleViewer, getKBHandler(d.KBRepo)))

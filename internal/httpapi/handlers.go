@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	authzhttp "github.com/costa92/llm-agent-authz/httpapi"
 
@@ -13,10 +14,12 @@ import (
 	"github.com/costa92/llm-agent-kb/internal/orgkb"
 )
 
-// maxUploadBytes caps a single document body in M1 (full upload validation is M2).
-const maxUploadBytes = 10 << 20 // 10 MiB
-
-func uploadHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
+// uploadHandler enqueues a document for async ingest (spec §6: 202 +
+// documentId). It applies the §16.3 upload validation (extension allowlist for
+// file sources) and the per-kb storage quota BEFORE enqueueing — validation
+// precedes quota precedes enqueue. The repo lookup is taken as a kbGetter so
+// the handler is unit-testable DB-free.
+func uploadHandler(repo kbGetter, ing Ingester, maxUpload, quota int64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kb, err := repo.Get(r.Context(), r.PathValue("id"))
 		if errors.Is(err, orgkb.ErrNotFound) {
@@ -26,14 +29,14 @@ func uploadHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		// JSON paste/markdown/txt body: {title, sourceType, content}. (multipart
-		// file upload is wired the same way; M1 accepts the JSON shape.)
 		var req struct {
 			Title      string `json:"title"`
 			SourceType string `json:"sourceType"`
 			Content    string `json:"content"`
+			URL        string `json:"url"`      // for sourceType=url
+			Filename   string `json:"filename"` // for file uploads (extension allowlist)
 		}
-		body := http.MaxBytesReader(w, r.Body, maxUploadBytes)
+		body := http.MaxBytesReader(w, r.Body, maxUpload)
 		raw, err := io.ReadAll(body)
 		if err != nil {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
@@ -43,20 +46,138 @@ func uploadHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		res, err := ing.Ingest(r.Context(), ingest.IngestInput{
-			KBID:       kb.ID,
-			Namespace:  kb.Namespace,
-			Title:      req.Title,
-			SourceType: ingest.SourceType(req.SourceType),
-			Raw:        []byte(req.Content),
+		st := ingest.SourceType(req.SourceType)
+		content := []byte(req.Content)
+		sourceRef := ""
+		switch st {
+		case ingest.SourceTypeURL:
+			sourceRef = req.URL
+			if sourceRef == "" {
+				http.Error(w, "url required for sourceType=url", http.StatusBadRequest)
+				return
+			}
+		case ingest.SourceTypePDF, ingest.SourceTypeDOCX:
+			// File bytes arrive base64-decoded by the client into Content; validate
+			// the declared filename's extension + size.
+			if err := ingest.ValidateUpload(req.Filename, int64(len(content)), maxUpload); err != nil {
+				http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+				return
+			}
+			sourceRef = req.Filename
+		}
+		// Per-kb storage quota (§16.3).
+		if used, err := ing.KBContentBytes(r.Context(), kb.ID); err == nil && used+int64(len(content)) > quota {
+			http.Error(w, "kb storage quota exceeded", http.StatusInsufficientStorage)
+			return
+		}
+		docID, err := ing.Enqueue(r.Context(), ingest.IngestInput{
+			KBID: kb.ID, Namespace: kb.Namespace, Title: req.Title,
+			SourceType: st, SourceRef: sourceRef, Raw: content,
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"documentId": res.DocumentID, "status": res.Status, "chunkCount": res.ChunkCount,
-		})
+		writeJSON(w, http.StatusAccepted, map[string]any{"documentId": docID, "status": "pending"})
+	}
+}
+
+// listDocsHandler returns up to limit documents for a kb, keyset-paginated by
+// id, in the §16.2 cursor envelope {items, next_cursor} (viewer+).
+func listDocsHandler(repo kbGetter, ing Ingester) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kb, err := repo.Get(r.Context(), r.PathValue("id"))
+		if errors.Is(err, orgkb.ErrNotFound) {
+			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		limit := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		items, next, err := ing.ListDocuments(r.Context(), kb.ID, limit, r.URL.Query().Get("cursor"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out := make([]ingest.DocumentView, 0, len(items))
+		out = append(out, items...)
+		writeJSON(w, http.StatusOK, map[string]any{"items": out, "next_cursor": next})
+	}
+}
+
+// retryHandler re-enqueues a dead document's job (editor+, spec §16.2).
+func retryHandler(repo kbGetter, ing Ingester) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kb, err := repo.Get(r.Context(), r.PathValue("id"))
+		if errors.Is(err, orgkb.ErrNotFound) {
+			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if err := ing.Retry(r.Context(), kb.ID, r.PathValue("docId")); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"documentId": r.PathValue("docId"), "status": "pending"})
+	}
+}
+
+// progressHandler streams document status as Server-Sent Events until the
+// document reaches a terminal state (ready/failed) or the client disconnects.
+func progressHandler(repo kbGetter, reader DocStatusReader) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kb, err := repo.Get(r.Context(), r.PathValue("id"))
+		if errors.Is(err, orgkb.ErrNotFound) {
+			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		docID := r.PathValue("docId")
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		emit := func() (terminal bool) {
+			status, phase, cc, errMsg, err := reader.DocumentStatus(r.Context(), kb.ID, docID)
+			if err != nil {
+				_, _ = io.WriteString(w, "event: error\ndata: {\"error\":\"not found\"}\n\n")
+				flusher.Flush()
+				return true
+			}
+			payload, _ := json.Marshal(map[string]any{"status": status, "phase": phase, "chunkCount": cc, "error": errMsg})
+			_, _ = io.WriteString(w, "data: "+string(payload)+"\n\n")
+			flusher.Flush()
+			return status == "ready" || status == "failed"
+		}
+		if emit() {
+			return
+		}
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				if emit() {
+					return
+				}
+			}
+		}
 	}
 }
 

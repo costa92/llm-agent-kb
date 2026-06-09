@@ -4,9 +4,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	authzhttp "github.com/costa92/llm-agent-authz/httpapi"
@@ -18,6 +20,7 @@ import (
 	openaiprovider "github.com/costa92/llm-agent-providers/openai"
 
 	"github.com/costa92/llm-agent-kb/internal/config"
+	"github.com/costa92/llm-agent-kb/internal/fetch"
 	"github.com/costa92/llm-agent-kb/internal/httpapi"
 	"github.com/costa92/llm-agent-kb/internal/ingest"
 	"github.com/costa92/llm-agent-kb/internal/obs"
@@ -103,6 +106,27 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 	ingestSvc := ingest.New(st.Pool(), rag)
 	retrievalSvc := retrieval.New(rag, retrieval.Config{MaxAskTokens: cfg.MaxAskTokens})
 
+	fetcher := fetch.New(fetch.Config{
+		Timeout:             cfg.FetchTimeout,
+		MaxBytes:            cfg.FetchMaxBytes,
+		AllowedContentTypes: []string{"text/html", "application/xhtml+xml", "text/plain"},
+	})
+
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.IngestWorkers; i++ {
+		w := ingest.NewWorker(ingest.WorkerConfig{
+			Pool: st.Pool(), Rag: rag, Fetcher: fetcher,
+			WorkerID:     fmt.Sprintf("kbd-%d", i),
+			Lease:        cfg.IngestLease,
+			MaxAttempts:  cfg.IngestMaxAttempts,
+			BaseBackoff:  cfg.IngestBaseBackoff,
+			ParseTimeout: cfg.ParseTimeout,
+		})
+		wg.Add(1)
+		go func() { defer wg.Done(); w.Run(workerCtx, cfg.IngestPollInterval) }()
+	}
+
 	issuer := authztoken.NewIssuer([]byte(cfg.JWTSecret), cfg.AccessTTL)
 	authService := authzsvc.New(az, issuer, cfg.RefreshTTL)
 	authHandlers := authzhttp.New(authService)
@@ -116,9 +140,15 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 		Ingester:     ingestSvc,
 		KBRepo:       kbRepo,
 		PerUserLimit: cfg.MaxRequestsPerUserPerMinute,
+
+		MaxUploadBytes:      cfg.MaxUploadBytes,
+		KBStorageQuotaBytes: cfg.KBStorageQuotaBytes,
+		DocStatus:           ingestSvc,
 	})
 
 	cleanup := func() {
+		stopWorkers() // signal workers to stop claiming
+		wg.Wait()     // drain in-flight jobs (lease protects un-drained ones)
 		_ = tp.Shutdown(ctx)
 		st.Close()
 	}
