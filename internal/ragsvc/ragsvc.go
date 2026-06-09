@@ -11,7 +11,9 @@ import (
 	ragcore "github.com/costa92/llm-agent-rag/rag"
 	ragstore "github.com/costa92/llm-agent-rag/store"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // AskRequest is the kb-side ask request. Hybrid=false is vector mode
@@ -23,9 +25,26 @@ type AskRequest struct {
 	MaxTotalTokens int
 }
 
+// GlobalRequest is the kb-side AskGlobal request. Isolation is Namespace-ONLY
+// (spec §8): GlobalOptions has no SecurityFilters; namespace isolation runs
+// after RBAC.
+type GlobalRequest struct {
+	Namespace      string
+	MaxCommunities int
+	MaxTotalTokens int
+}
+
+// DriftRequest is the kb-side AskDrift request. Namespace-only isolation (§8).
+type DriftRequest struct {
+	Namespace      string
+	MaxCommunities int
+	Rounds         int
+	TopK           int
+	MaxTotalTokens int
+}
+
 // RagPort is the narrow rag surface every non-rag kb package depends on.
-// M1: Ask + Import + the three delete primitives (§16.4). No AskGlobal/
-// AskDrift/Prewarm — those arrive in M3.
+// M1: Ask + Import + the three delete primitives (§16.4).
 type RagPort interface {
 	Ask(ctx context.Context, question string, req AskRequest) (ragcore.Answer, error)
 	Import(ctx context.Context, docs []ragingest.Document, opts ragingest.ImportOptions) (ragingest.ImportResult, error)
@@ -36,6 +55,34 @@ type RagPort interface {
 	RemoveGraphBySource(ctx context.Context, namespace string, chunkIDs []string) error
 	// RemoveChunks deletes every chunk for a source in a namespace.
 	RemoveChunks(ctx context.Context, namespace, sourceID string) (int, error)
+	// M3 GraphRAG. AskGlobal/AskDrift/PrewarmCommunityReports delegate to
+	// Wrapper.Inner() (*rag.System) with kb-self-instrumented spans — the
+	// otelrag Wrapper does NOT instrument the GraphRAG paths (§11).
+	AskGlobal(ctx context.Context, question string, req GlobalRequest) (ragcore.Answer, error)
+	AskDrift(ctx context.Context, question string, req DriftRequest) (ragcore.Answer, error)
+	PrewarmCommunityReports(ctx context.Context, namespace string) (int, error)
+	// Community views read directly from the held postgres.Store
+	// (a store.CommunityStore) and return kb-local DTOs (not rag/graph types)
+	// so importers (retrieval/httpapi) never depend on rag/graph (spec §4).
+	ListCommunities(ctx context.Context, namespace string) ([]CommunityView, error)
+	CommunityReport(ctx context.Context, namespace, communityID string) (CommunityReportView, bool, error)
+}
+
+// CommunityView is the kb-local projection of a graph.Community. Keeping it
+// here (not exposing raggraph.Community) makes ragsvc the SOLE importer of
+// rag/graph (spec §4) — retrieval/httpapi/cmd-kbd type against these DTOs.
+type CommunityView struct {
+	ID          string
+	Level       int
+	ParentID    string
+	EntityCount int
+}
+
+// CommunityReportView is the kb-local projection of a graph.CommunityReport.
+type CommunityReportView struct {
+	ID      string // the CommunityID the report describes
+	Title   string
+	Summary string
 }
 
 // Deps are the construction inputs for the service.
@@ -51,6 +98,7 @@ type Deps struct {
 type Service struct {
 	wrapper    *otelrag.Wrapper
 	chunkStore *ragpostgres.Store
+	tracer     trace.Tracer
 }
 
 // New wires the adapters, rag.System, and the otelrag wrapper.
@@ -66,7 +114,15 @@ func New(d Deps) *Service {
 	} else {
 		wrapper = otelrag.Wrap(sys)
 	}
-	return &Service{wrapper: wrapper, chunkStore: d.ChunkStore}
+	// The otelrag Wrapper holds the same TracerProvider but exposes no
+	// GraphRAG spans, so kb keeps its own tracer for AskGlobal/AskDrift/Prewarm.
+	var tracer trace.Tracer
+	if d.Tracer != nil {
+		tracer = d.Tracer.Tracer("github.com/costa92/llm-agent-kb/internal/ragsvc")
+	} else {
+		tracer = noop.NewTracerProvider().Tracer("ragsvc")
+	}
+	return &Service{wrapper: wrapper, chunkStore: d.ChunkStore, tracer: tracer}
 }
 
 func (s *Service) Ask(ctx context.Context, question string, req AskRequest) (ragcore.Answer, error) {
@@ -121,4 +177,78 @@ func (s *Service) RemoveChunks(ctx context.Context, namespace, sourceID string) 
 	return s.chunkStore.RemoveByFilter(ctx, namespace, ragstore.Filter{
 		ragingest.MetadataSourceIDKey: sourceID,
 	})
+}
+
+func (s *Service) AskGlobal(ctx context.Context, question string, req GlobalRequest) (ragcore.Answer, error) {
+	ctx, span := s.tracer.Start(ctx, "ragsvc.AskGlobal")
+	defer span.End()
+	span.SetAttributes(attribute.String("rag.namespace", req.Namespace))
+	ans, err := s.wrapper.Inner().AskGlobal(ctx, question, ragcore.GlobalOptions{
+		Namespace:      req.Namespace,
+		MaxCommunities: req.MaxCommunities,
+		MaxTotalTokens: req.MaxTotalTokens,
+	})
+	if err != nil {
+		span.RecordError(err)
+	}
+	return ans, err
+}
+
+func (s *Service) AskDrift(ctx context.Context, question string, req DriftRequest) (ragcore.Answer, error) {
+	ctx, span := s.tracer.Start(ctx, "ragsvc.AskDrift")
+	defer span.End()
+	span.SetAttributes(attribute.String("rag.namespace", req.Namespace))
+	ans, err := s.wrapper.Inner().AskDrift(ctx, question, ragcore.DriftOptions{
+		Namespace:      req.Namespace,
+		MaxCommunities: req.MaxCommunities,
+		Rounds:         req.Rounds,
+		TopK:           req.TopK,
+		MaxTotalTokens: req.MaxTotalTokens,
+	})
+	if err != nil {
+		span.RecordError(err)
+	}
+	return ans, err
+}
+
+func (s *Service) PrewarmCommunityReports(ctx context.Context, namespace string) (int, error) {
+	ctx, span := s.tracer.Start(ctx, "ragsvc.PrewarmCommunityReports")
+	defer span.End()
+	span.SetAttributes(attribute.String("rag.namespace", namespace))
+	n, err := s.wrapper.Inner().PrewarmCommunityReports(ctx, namespace)
+	if err != nil {
+		span.RecordError(err)
+	}
+	return n, err
+}
+
+func (s *Service) ListCommunities(ctx context.Context, namespace string) ([]CommunityView, error) {
+	if s.chunkStore == nil {
+		return nil, fmt.Errorf("ragsvc: chunk store not configured")
+	}
+	comms, err := s.chunkStore.Communities(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]CommunityView, 0, len(comms))
+	for _, c := range comms {
+		views = append(views, CommunityView{
+			ID:          c.ID,
+			Level:       c.Level,
+			ParentID:    c.ParentID,
+			EntityCount: len(c.EntityIDs),
+		})
+	}
+	return views, nil
+}
+
+func (s *Service) CommunityReport(ctx context.Context, namespace, communityID string) (CommunityReportView, bool, error) {
+	if s.chunkStore == nil {
+		return CommunityReportView{}, false, fmt.Errorf("ragsvc: chunk store not configured")
+	}
+	rep, ok, err := s.chunkStore.CommunityReport(ctx, namespace, communityID)
+	if err != nil || !ok {
+		return CommunityReportView{}, ok, err
+	}
+	return CommunityReportView{ID: rep.CommunityID, Title: rep.Title, Summary: rep.Summary}, true, nil
 }

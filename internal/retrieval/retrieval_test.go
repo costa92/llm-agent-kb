@@ -27,6 +27,22 @@ func (f *fakeRag) ListChunkIDs(context.Context, string, string) ([]string, error
 func (f *fakeRag) RemoveGraphBySource(context.Context, string, []string) error    { return nil }
 func (f *fakeRag) RemoveChunks(context.Context, string, string) (int, error)      { return 0, nil }
 
+// M3 RagPort surface — stubs to satisfy the widened interface; Task 5 replaces
+// AskGlobal/AskDrift with canned-answer behavior for the global/drift mapping tests.
+func (f *fakeRag) AskGlobal(_ context.Context, _ string, _ ragsvc.GlobalRequest) (ragcore.Answer, error) {
+	return f.answer, nil
+}
+func (f *fakeRag) AskDrift(_ context.Context, _ string, _ ragsvc.DriftRequest) (ragcore.Answer, error) {
+	return f.answer, nil
+}
+func (f *fakeRag) PrewarmCommunityReports(context.Context, string) (int, error) { return 0, nil }
+func (f *fakeRag) ListCommunities(context.Context, string) ([]ragsvc.CommunityView, error) {
+	return nil, nil
+}
+func (f *fakeRag) CommunityReport(context.Context, string, string) (ragsvc.CommunityReportView, bool, error) {
+	return ragsvc.CommunityReportView{}, false, nil
+}
+
 func TestAskMapsModeAndCitations(t *testing.T) {
 	f := &fakeRag{answer: ragcore.Answer{
 		Text: "the answer",

@@ -11,11 +11,39 @@ import (
 	"github.com/costa92/llm-agent-contract/llm"
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
 	ragpostgres "github.com/costa92/llm-agent-rag/postgres"
+	ragcore "github.com/costa92/llm-agent-rag/rag"
 	ragstore "github.com/costa92/llm-agent-rag/store"
 )
 
 // Compile-time: the concrete service must satisfy RagPort.
 var _ RagPort = (*Service)(nil)
+
+// Compile-time: the widened RagPort surface. Community reads return kb-local
+// DTOs (CommunityView/CommunityReportView) so importers never see rag/graph.
+var _ interface {
+	AskGlobal(ctx context.Context, question string, req GlobalRequest) (ragcore.Answer, error)
+	AskDrift(ctx context.Context, question string, req DriftRequest) (ragcore.Answer, error)
+	PrewarmCommunityReports(ctx context.Context, namespace string) (int, error)
+	ListCommunities(ctx context.Context, namespace string) ([]CommunityView, error)
+	CommunityReport(ctx context.Context, namespace, communityID string) (CommunityReportView, bool, error)
+} = (*Service)(nil)
+
+func TestAskGlobalEmptyWhenNoCommunities(t *testing.T) {
+	// In-memory store, no detector configured → zero communities → AskGlobal
+	// returns an empty (no-error) answer. Proves the Inner() delegation + span
+	// path compiles and runs without a DB.
+	model := llm.NewScriptedLLM(llm.WithResponses(llm.TextResponse("unused")))
+	embedder := llm.NewScriptedLLM(llm.WithEmbedDimensions(8))
+	svc := New(Deps{Model: model, Embedder: embedder})
+	ctx := context.Background()
+	ans, err := svc.AskGlobal(ctx, "what themes?", GlobalRequest{Namespace: "ns", MaxCommunities: 4})
+	if err != nil {
+		t.Fatalf("AskGlobal: %v", err)
+	}
+	if ans.Text != "" {
+		t.Fatalf("AskGlobal over a community-less namespace = %q, want empty", ans.Text)
+	}
+}
 
 func TestNewWiresInMemorySystemForUnitTest(t *testing.T) {
 	// With a nil store the rag default in-memory store is used; this proves
