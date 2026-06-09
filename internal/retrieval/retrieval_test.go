@@ -37,6 +37,7 @@ func (f *fakeRag) AskDrift(_ context.Context, _ string, _ ragsvc.DriftRequest) (
 	return f.driftAns, nil
 }
 func (f *fakeRag) PrewarmCommunityReports(context.Context, string) (int, error) { return 0, nil }
+func (f *fakeRag) RecomputeCommunities(context.Context, string) error           { return nil }
 func (f *fakeRag) ListCommunities(context.Context, string) ([]ragsvc.CommunityView, error) {
 	return nil, nil
 }

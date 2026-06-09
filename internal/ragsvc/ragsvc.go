@@ -62,6 +62,11 @@ type RagPort interface {
 	AskGlobal(ctx context.Context, question string, req GlobalRequest) (ragcore.Answer, error)
 	AskDrift(ctx context.Context, question string, req DriftRequest) (ragcore.Answer, error)
 	PrewarmCommunityReports(ctx context.Context, namespace string) (int, error)
+	// RecomputeCommunities re-detects the namespace's communities over the
+	// CURRENT (post-delete) graph and refreshes reports. §16.4: communities
+	// cannot be deleted per-source (Louvain is full-namespace), so after a
+	// delete the caller recomputes. No-op when the store/detector is absent.
+	RecomputeCommunities(ctx context.Context, namespace string) error
 	// Community views read directly from the held postgres.Store
 	// (a store.CommunityStore) and return kb-local DTOs (not rag/graph types)
 	// so importers (retrieval/httpapi) never depend on rag/graph (spec §4).
@@ -108,6 +113,7 @@ type Service struct {
 	wrapper    *otelrag.Wrapper
 	chunkStore *ragpostgres.Store
 	tracer     trace.Tracer
+	detector   raggraph.CommunityDetector // for §16.4 post-delete recompute; nil → recompute is a no-op
 }
 
 // New wires the adapters, rag.System, and the otelrag wrapper.
@@ -135,7 +141,7 @@ func New(d Deps) *Service {
 	} else {
 		tracer = noop.NewTracerProvider().Tracer("ragsvc")
 	}
-	return &Service{wrapper: wrapper, chunkStore: d.ChunkStore, tracer: tracer}
+	return &Service{wrapper: wrapper, chunkStore: d.ChunkStore, tracer: tracer, detector: d.CommunityDetector}
 }
 
 func (s *Service) Ask(ctx context.Context, question string, req AskRequest) (ragcore.Answer, error) {
@@ -233,6 +239,35 @@ func (s *Service) PrewarmCommunityReports(ctx context.Context, namespace string)
 		span.RecordError(err)
 	}
 	return n, err
+}
+
+func (s *Service) RecomputeCommunities(ctx context.Context, namespace string) error {
+	ctx, span := s.tracer.Start(ctx, "ragsvc.RecomputeCommunities")
+	defer span.End()
+	span.SetAttributes(attribute.String("rag.namespace", namespace))
+	if s.chunkStore == nil || s.detector == nil {
+		return nil // graceful: no graph capability → nothing to recompute
+	}
+	snap, err := s.chunkStore.GraphSnapshot(ctx, namespace)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("ragsvc: recompute snapshot: %w", err)
+	}
+	communities, err := s.detector.Detect(ctx, snap)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("ragsvc: recompute detect: %w", err)
+	}
+	if err := s.chunkStore.UpsertCommunities(ctx, namespace, communities); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("ragsvc: recompute upsert: %w", err)
+	}
+	// Refresh reports for the new community set (stale-hash entries regenerate).
+	if _, err := s.wrapper.Inner().PrewarmCommunityReports(ctx, namespace); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("ragsvc: recompute prewarm: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) ListCommunities(ctx context.Context, namespace string) ([]CommunityView, error) {
