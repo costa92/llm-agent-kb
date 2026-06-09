@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -18,8 +19,11 @@ const maxUploadBytes = 10 << 20 // 10 MiB
 func uploadHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kb, err := repo.Get(r.Context(), r.PathValue("id"))
-		if err != nil {
+		if errors.Is(err, orgkb.ErrNotFound) {
 			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		// JSON paste/markdown/txt body: {title, sourceType, content}. (multipart
@@ -59,8 +63,11 @@ func uploadHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 func deleteDocHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kb, err := repo.Get(r.Context(), r.PathValue("id"))
-		if err != nil {
+		if errors.Is(err, orgkb.ErrNotFound) {
 			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		if err := ing.DeleteDocument(r.Context(), kb.Namespace, r.PathValue("docId")); err != nil {
@@ -74,8 +81,11 @@ func deleteDocHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 func getKBHandler(repo *orgkb.Repo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kb, err := repo.Get(r.Context(), r.PathValue("id"))
-		if err != nil {
+		if errors.Is(err, orgkb.ErrNotFound) {
 			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -168,8 +178,11 @@ func listKBHandler(repo *orgkb.Repo) http.HandlerFunc {
 func deleteKBHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kb, err := repo.Get(r.Context(), r.PathValue("id"))
-		if err != nil {
+		if errors.Is(err, orgkb.ErrNotFound) {
 			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		// 1. Cascade-delete all documents (chunks + graph) for the kb.
