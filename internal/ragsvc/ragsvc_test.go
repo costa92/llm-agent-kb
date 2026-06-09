@@ -159,6 +159,95 @@ func TestGraphComponentsWiredImport(t *testing.T) {
 	}
 }
 
+// TestGraphRAGLivePgvector ingests two thematically-distinct docs into a real
+// pgvector store with the deterministic graph components, asserts communities
+// land in the store, prewarms reports, then asserts AskGlobal returns the
+// scripted reduce text. Gated on LLM_AGENT_KB_PG_URL. Owns its DB (drops the
+// rag tables it uses).
+func TestGraphRAGLivePgvector(t *testing.T) {
+	ctx := context.Background()
+	dsn := os.Getenv("LLM_AGENT_KB_PG_URL")
+	if dsn == "" {
+		t.Skipf("set LLM_AGENT_KB_PG_URL (pgvector) to run the live GraphRAG test")
+	}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		return ragpostgres.RegisterTypes(ctx, conn)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	for _, tbl := range []string{"chunks_community_reports", "chunks_communities", "chunks_relations", "chunks_entities", "chunks"} {
+		_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS "+tbl+" CASCADE")
+	}
+	chunkStore, err := ragpostgres.New(pool, ragpostgres.Config{Dimension: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := chunkStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	model := llm.NewScriptedLLM(llm.WithResponses(
+		// Map responses MUST carry a `Score:` prefix — rag's parseGlobalMap only
+		// assigns a point-score on a leading `Score:` line (global.go:157); plain
+		// text parses to score 0, the reduce stage drops all score-0 partials,
+		// ReduceCalls stays 0, and AskGlobal returns the "no relevant community
+		// information" answer (mirrors rag's own global_test.go scripting).
+		llm.TextResponse("Score: 80\nmap-a"), llm.TextResponse("Score: 80\nmap-b"),
+		llm.TextResponse("Score: 80\nmap-c"), llm.TextResponse("Score: 80\nmap-d"),
+		llm.TextResponse("GLOBAL ANSWER: two themes"),
+	))
+	embedder := llm.NewScriptedLLM(llm.WithEmbedDimensions(8))
+	svc := New(Deps{
+		Model: model, Embedder: embedder,
+		RagStore: chunkStore, ChunkStore: chunkStore,
+		EntityExtractor: raggraph.DictionaryEntityExtractor{Terms: map[string]string{
+			"alpha": "topic", "bravo": "topic", "carbon": "topic", "delta": "topic",
+		}},
+		CommunityDetector:   raggraph.LouvainDetector{},
+		CommunitySummarizer: fixedSummarizer{},
+	})
+	docs := []ragingest.Document{
+		{ID: "d1", SourceID: "d1", Title: "T1", Content: "alpha bravo alpha bravo alpha"},
+		{ID: "d2", SourceID: "d2", Title: "T2", Content: "carbon delta carbon delta carbon"},
+	}
+	if _, err := svc.Import(ctx, docs, ragingest.ImportOptions{Namespace: "g1", ReplaceSource: true}); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	comms, err := svc.ListCommunities(ctx, "g1")
+	if err != nil {
+		t.Fatalf("ListCommunities: %v", err)
+	}
+	if len(comms) == 0 {
+		t.Fatal("Import did not persist communities to pgvector")
+	}
+	if _, err := svc.PrewarmCommunityReports(ctx, "g1"); err != nil {
+		t.Fatalf("Prewarm: %v", err)
+	}
+	rep, ok, err := svc.CommunityReport(ctx, "g1", comms[0].ID)
+	if err != nil || !ok {
+		t.Fatalf("CommunityReport(%s) ok=%v err=%v", comms[0].ID, ok, err)
+	}
+	if rep.Title == "" {
+		t.Fatalf("prewarmed report has empty title")
+	}
+	ans, err := svc.AskGlobal(ctx, "what are the themes?", GlobalRequest{Namespace: "g1", MaxCommunities: 8})
+	if err != nil {
+		t.Fatalf("AskGlobal: %v", err)
+	}
+	if ans.Text == "" {
+		t.Fatalf("AskGlobal returned empty text over a populated namespace")
+	}
+	if ans.Diagnostics.Global.ReduceCalls != 1 {
+		t.Fatalf("expected exactly 1 reduce call, got %d (map=%d)", ans.Diagnostics.Global.ReduceCalls, ans.Diagnostics.Global.MapCalls)
+	}
+}
+
 // fixedSummarizer is a deterministic CommunitySummarizer (mirrors rag's
 // staticSummarizer) so reports are reproducible without an LLM cursor. Reused
 // by Task 4's gated live-pgvector test.
