@@ -86,8 +86,9 @@ func (s *Storage) RagStore() *ragpostgres.Store { return s.ragStore }
 // Close releases the pool.
 func (s *Storage) Close() { s.pool.Close() }
 
-// businessMigrations are the M1 kb-owned tables. ingest_job, qa_session,
-// qa_message, and eval_run are deferred to their milestones (spec §13).
+// businessMigrations are the M1 kb-owned tables plus M2 additions:
+// ingest_job lease-queue, and document.phase/content_bytes/content columns.
+// All statements are idempotent (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
 var businessMigrations = []string{
 	`CREATE TABLE IF NOT EXISTS knowledge_base (
 		id              TEXT PRIMARY KEY,
@@ -107,11 +108,39 @@ var businessMigrations = []string{
 		source_id    TEXT NOT NULL,
 		checksum     TEXT NOT NULL DEFAULT '',
 		status       TEXT NOT NULL DEFAULT 'pending',
+		phase        TEXT NOT NULL DEFAULT '',
 		error        TEXT NOT NULL DEFAULT '',
 		chunk_count  INT  NOT NULL DEFAULT 0,
 		created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`,
 	`CREATE INDEX IF NOT EXISTS document_kb_idx ON document (kb_id)`,
+	`CREATE TABLE IF NOT EXISTS ingest_job (
+		id              TEXT PRIMARY KEY,
+		document_id     TEXT REFERENCES document(id) ON DELETE CASCADE,
+		state           TEXT NOT NULL DEFAULT 'pending',
+		attempts        INT  NOT NULL DEFAULT 0,
+		next_run_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+		locked_by       TEXT NOT NULL DEFAULT '',
+		locked_until    TIMESTAMPTZ,
+		idempotency_key TEXT NOT NULL,
+		last_error      TEXT NOT NULL DEFAULT '',
+		phase           TEXT NOT NULL DEFAULT '',
+		updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS ingest_job_idem_idx ON ingest_job (idempotency_key)`,
+	// Claim query orders by next_run_at among claimable rows; index it.
+	`CREATE INDEX IF NOT EXISTS ingest_job_claim_idx ON ingest_job (state, next_run_at)`,
+	// document_kb_idx already exists in M1; add columns for quota accounting and
+	// for the async worker's raw-content re-read (loadRaw reads document.content).
+	`ALTER TABLE document ADD COLUMN IF NOT EXISTS content_bytes BIGINT NOT NULL DEFAULT 0`,
+	// content holds the raw uploaded bytes so the async worker can re-parse after
+	// the HTTP request returns (paste/file in content; url sources leave it empty).
+	// Load-bearing: worker.loadRaw's `SELECT content` (Task 8) requires this column.
+	`ALTER TABLE document ADD COLUMN IF NOT EXISTS content BYTEA`,
+	// phase upgrade-in-place: the inline column above is only added on a fresh DB
+	// (CREATE TABLE IF NOT EXISTS skips the body when table already exists), so
+	// explicitly ALTER for M1→M2 in-place upgrades.
+	`ALTER TABLE document ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT ''`,
 }
 
 // Migrate applies the rag store migrations (chunks/graph/community + the
