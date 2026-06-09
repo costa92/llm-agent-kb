@@ -116,6 +116,10 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 		Ingester:     ingestSvc,
 		KBRepo:       kbRepo,
 		PerUserLimit: cfg.MaxRequestsPerUserPerMinute,
+
+		MaxUploadBytes:      cfg.MaxUploadBytes,
+		KBStorageQuotaBytes: cfg.KBStorageQuotaBytes,
+		DocStatus:           ingestSvc,
 	})
 
 	cleanup := func() {

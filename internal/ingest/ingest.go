@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -74,48 +73,6 @@ type IngestInput struct {
 	SourceRef  string // url for SourceTypeURL; original filename for files
 	SourceType SourceType
 	Raw        []byte
-}
-
-// Result is the outcome of Ingest.
-type Result struct {
-	DocumentID string
-	Status     string
-	ChunkCount int
-}
-
-// Ingest writes the document row, parses, imports synchronously, and marks the
-// document ready. On parse/import failure the row is marked failed with the
-// error recorded.
-func (s *Service) Ingest(ctx context.Context, in IngestInput) (Result, error) {
-	deps := parseDeps{parseTimeout: 30 * time.Second}
-	content, _, err := parseSource(ctx, deps, in.SourceType, in.Raw, "")
-	if err != nil {
-		return Result{}, err
-	}
-	docID := newID()
-	cs := checksum(content)
-	if _, err := s.pool.Exec(ctx,
-		`INSERT INTO document (id, kb_id, title, source_type, source_id, checksum, status)
-		 VALUES ($1, $2, $3, $4, $1, $5, 'parsing')`,
-		docID, in.KBID, in.Title, string(in.SourceType), cs); err != nil {
-		return Result{}, fmt.Errorf("ingest: insert document: %w", err)
-	}
-
-	doc := makeDocument(docID, in.KBID, in.SourceType, in.Title, content)
-	res, err := s.rag.Import(ctx, []ragingest.Document{doc}, ragingest.ImportOptions{
-		Namespace:     in.Namespace,
-		ReplaceSource: true,
-	})
-	if err != nil {
-		_, _ = s.pool.Exec(ctx,
-			`UPDATE document SET status='failed', error=$2 WHERE id=$1`, docID, err.Error())
-		return Result{}, fmt.Errorf("ingest: import: %w", err)
-	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE document SET status='ready', chunk_count=$2 WHERE id=$1`, docID, res.Chunks); err != nil {
-		return Result{}, fmt.Errorf("ingest: mark ready: %w", err)
-	}
-	return Result{DocumentID: docID, Status: "ready", ChunkCount: res.Chunks}, nil
 }
 
 // Enqueue writes document(pending) + ingest_job(pending) in one tx and returns
@@ -190,6 +147,16 @@ func (s *Service) Enqueue(ctx context.Context, in IngestInput) (string, error) {
 		return "", err
 	}
 	return docID, nil
+}
+
+// DocumentStatus reads a single document's status/phase for progress SSE.
+func (s *Service) DocumentStatus(ctx context.Context, kbID, docID string) (string, string, int, string, error) {
+	var status, phase, errMsg string
+	var cc int
+	err := s.pool.QueryRow(ctx,
+		`SELECT status, phase, chunk_count, error FROM document WHERE id=$1 AND kb_id=$2`,
+		docID, kbID).Scan(&status, &phase, &cc, &errMsg)
+	return status, phase, cc, errMsg, err
 }
 
 // KBContentBytes returns the cumulative content_bytes for a kb (quota accounting).

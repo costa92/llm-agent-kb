@@ -17,9 +17,111 @@ import (
 	authzstore "github.com/costa92/llm-agent-authz/store"
 	authztoken "github.com/costa92/llm-agent-authz/token"
 
+	"github.com/costa92/llm-agent-kb/internal/ingest"
 	"github.com/costa92/llm-agent-kb/internal/orgkb"
 	"github.com/costa92/llm-agent-kb/internal/retrieval"
 )
+
+// fakeIngester satisfies the (widened) Ingester so the M2 document handlers can
+// be driven without a DB. KBContentBytes returns usedBytes for the quota test;
+// Enqueue records the input (or returns enqErr).
+type fakeIngester struct {
+	enqueued  ingest.IngestInput
+	docs      []ingest.DocumentView
+	retried   string
+	usedBytes int64 // KBContentBytes returns this (for the quota test)
+	enqErr    error // optional Enqueue error
+}
+
+func (f *fakeIngester) Enqueue(ctx context.Context, in ingest.IngestInput) (string, error) {
+	if f.enqErr != nil {
+		return "", f.enqErr
+	}
+	f.enqueued = in
+	return "doc-123", nil
+}
+func (f *fakeIngester) DeleteDocument(ctx context.Context, ns, id string) error { return nil }
+func (f *fakeIngester) DeleteAllDocumentsForKB(ctx context.Context, ns, kbID string) error {
+	return nil
+}
+func (f *fakeIngester) ListDocuments(ctx context.Context, kbID string, limit int, cursor string) ([]ingest.DocumentView, string, error) {
+	return f.docs, "", nil
+}
+func (f *fakeIngester) KBContentBytes(ctx context.Context, kbID string) (int64, error) {
+	return f.usedBytes, nil
+}
+func (f *fakeIngester) Retry(ctx context.Context, kbID, docID string) error {
+	f.retried = docID
+	return nil
+}
+
+var _ Ingester = (*fakeIngester)(nil)
+
+// fakeKBGetter satisfies the kbGetter interface so uploadHandler can be driven
+// without a DB. It returns a fixed kb (or ErrNotFound if id is "missing").
+type fakeKBGetter struct{}
+
+func (fakeKBGetter) Get(ctx context.Context, id string) (orgkb.KB, error) {
+	if id == "missing" {
+		return orgkb.KB{}, orgkb.ErrNotFound
+	}
+	return orgkb.KB{ID: id, Namespace: "ns_" + id}, nil
+}
+
+var _ kbGetter = fakeKBGetter{}
+
+// newUploadRequest builds a *http.Request carrying {id} as a path value (the
+// handler reads r.PathValue("id")) and the JSON upload body.
+func newUploadRequest(kbID, jsonBody string) *http.Request {
+	r := httptest.NewRequest("POST", "/api/kb/"+kbID+"/documents", strings.NewReader(jsonBody))
+	r.SetPathValue("id", kbID)
+	return r
+}
+
+// TestUploadRejectsDisallowedExtension: a pdf/docx upload whose filename has a
+// disallowed extension is rejected with 415 before any enqueue.
+func TestUploadRejectsDisallowedExtension(t *testing.T) {
+	ing := &fakeIngester{}
+	h := uploadHandler(fakeKBGetter{}, ing, 10<<20, 256<<20)
+	rec := httptest.NewRecorder()
+	h(rec, newUploadRequest("kb1", `{"title":"x","sourceType":"pdf","filename":"evil.exe","content":"AAAA"}`))
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("code=%d want 415", rec.Code)
+	}
+	if ing.enqueued.KBID != "" {
+		t.Fatal("enqueue must not be called on a rejected upload")
+	}
+}
+
+// TestUploadRejectsOverQuota: when used+incoming exceeds the kb quota, the
+// handler returns 507 Insufficient Storage and does not enqueue.
+func TestUploadRejectsOverQuota(t *testing.T) {
+	ing := &fakeIngester{usedBytes: 256 << 20} // already at quota
+	h := uploadHandler(fakeKBGetter{}, ing, 10<<20, 256<<20)
+	rec := httptest.NewRecorder()
+	h(rec, newUploadRequest("kb1", `{"title":"x","sourceType":"paste","content":"more bytes"}`))
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("code=%d want 507", rec.Code)
+	}
+	if ing.enqueued.KBID != "" {
+		t.Fatal("enqueue must not be called when over quota")
+	}
+}
+
+// TestUploadAcceptsPaste: a valid paste upload returns 202 + documentId and
+// passes the parsed input to Enqueue.
+func TestUploadAcceptsPaste(t *testing.T) {
+	ing := &fakeIngester{}
+	h := uploadHandler(fakeKBGetter{}, ing, 10<<20, 256<<20)
+	rec := httptest.NewRecorder()
+	h(rec, newUploadRequest("kb1", `{"title":"Doc","sourceType":"paste","content":"hello"}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code=%d want 202", rec.Code)
+	}
+	if ing.enqueued.Title != "Doc" || string(ing.enqueued.Raw) != "hello" {
+		t.Fatalf("enqueue got %+v", ing.enqueued)
+	}
+}
 
 // fakeResolver implements authzhttp.RoleResolver semantics for tests.
 type fakeResolver struct{ role authzrole.Role }
