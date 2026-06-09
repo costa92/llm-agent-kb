@@ -87,3 +87,51 @@ func TestLoadRejectsUnknownProvider(t *testing.T) {
 		t.Fatal("unknown provider must error")
 	}
 }
+
+func TestLoadGraphDefaults(t *testing.T) {
+	cfg, err := LoadFromLookup(func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GraphEnabled {
+		t.Errorf("GraphEnabled default = false, want true")
+	}
+	if cfg.LouvainResolution != 1.0 {
+		t.Errorf("LouvainResolution = %v, want 1.0", cfg.LouvainResolution)
+	}
+	if cfg.EntityResolverEnabled {
+		t.Errorf("EntityResolverEnabled default = true, want false (opt-in)")
+	}
+	if cfg.GlobalMaxCommunities != 8 {
+		t.Errorf("GlobalMaxCommunities = %d, want 8", cfg.GlobalMaxCommunities)
+	}
+	if cfg.DriftRounds != 2 {
+		t.Errorf("DriftRounds = %d, want 2", cfg.DriftRounds)
+	}
+}
+
+func TestLoadGraphOverrides(t *testing.T) {
+	env := map[string]string{
+		"GRAPH_ENABLED":             "false",
+		"LOUVAIN_RESOLUTION":        "1.5",
+		"ENTITY_RESOLVER_ENABLED":   "true",
+		"ENTITY_RESOLVER_THRESHOLD": "0.92",
+		"GLOBAL_MAX_COMMUNITIES":    "16",
+	}
+	cfg, err := LoadFromLookup(func(k string) (string, bool) { v, ok := env[k]; return v, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GraphEnabled {
+		t.Error("GRAPH_ENABLED=false not honored")
+	}
+	if cfg.LouvainResolution != 1.5 {
+		t.Errorf("LouvainResolution = %v, want 1.5", cfg.LouvainResolution)
+	}
+	if !cfg.EntityResolverEnabled || cfg.EntityResolverThreshold != 0.92 {
+		t.Errorf("resolver override not honored: enabled=%v thr=%v", cfg.EntityResolverEnabled, cfg.EntityResolverThreshold)
+	}
+	if cfg.GlobalMaxCommunities != 16 {
+		t.Errorf("GlobalMaxCommunities = %d, want 16", cfg.GlobalMaxCommunities)
+	}
+}
