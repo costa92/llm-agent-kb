@@ -7,9 +7,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
@@ -20,6 +22,19 @@ import (
 func checksum(content string) string {
 	sum := sha256.Sum256([]byte(content))
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// idempotencyKey derives a stable dedup key for an enqueue. source_ref (url or
+// original filename) identifies the source when present, else the title (paste).
+// Including checksum means a changed paste/file body re-enqueues (new key) while
+// an identical re-upload collides on the UNIQUE(idempotency_key) index.
+func idempotencyKey(kbID, sourceRef, title, cs string) string {
+	srcKey := sourceRef
+	if srcKey == "" {
+		srcKey = title
+	}
+	sum := sha256.Sum256([]byte(kbID + ":" + srcKey + ":" + cs))
+	return "idem:" + hex.EncodeToString(sum[:])
 }
 
 // makeDocument builds the ragingest.Document. ID=SourceID=docID drives
@@ -133,6 +148,14 @@ func (s *Service) Enqueue(ctx context.Context, in IngestInput) (string, error) {
 			return existing, nil // identical content already indexed — no-op
 		}
 	}
+	// idempotency_key collides for concurrent identical enqueues so the
+	// UNIQUE(idempotency_key) index gives a real transactional dedup guarantee
+	// (the best-effort checksum short-circuit above runs outside the tx and can
+	// race). Key = sha256(kb_id : source_key : checksum); source_key is the
+	// source_ref (url/file) when present, else the title (paste). For url sources
+	// cs is empty, so the key is stable per (kb_id, url) — identical re-enqueues
+	// of the same URL still collide.
+	idemKey := idempotencyKey(in.KBID, in.SourceRef, in.Title, cs)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -147,7 +170,20 @@ func (s *Service) Enqueue(ctx context.Context, in IngestInput) (string, error) {
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingest_job (id, document_id, state, idempotency_key)
 		 VALUES ($1,$2,'pending',$3)`,
-		newID(), docID, docID); err != nil {
+		newID(), docID, idemKey); err != nil {
+		// 23505 = unique_violation: an identical enqueue already holds this key.
+		// Roll back this doc insert and return the existing document — genuine
+		// idempotency rather than a surfaced error.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			_ = tx.Rollback(ctx)
+			var existing string
+			if qerr := s.pool.QueryRow(ctx,
+				`SELECT document_id FROM ingest_job WHERE idempotency_key=$1`, idemKey).Scan(&existing); qerr == nil && existing != "" {
+				return existing, nil
+			}
+			return "", fmt.Errorf("ingest: insert job: %w", err)
+		}
 		return "", fmt.Errorf("ingest: insert job: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

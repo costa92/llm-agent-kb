@@ -3,6 +3,8 @@ package ingest
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,6 +198,89 @@ func TestWorkerReclaimsStuckLease(t *testing.T) {
 	}
 	if status, _ := docStatus(t, ctx, pool, docID); status != "ready" {
 		t.Fatalf("status=%q want ready after reclaim", status)
+	}
+}
+
+// TestWorkerConcurrentClaimSingleWinner enqueues ONE pending job, then launches
+// N goroutines that each call claim() concurrently against the same queue, and
+// asserts EXACTLY ONE observes the job. This locks the FOR UPDATE SKIP LOCKED
+// no-double-claim guarantee: the losers must get (false, nil), not the job.
+func TestWorkerConcurrentClaimSingleWinner(t *testing.T) {
+	ctx := context.Background()
+	pool, rag, svc, clk := freshWorkerDB(t, ctx)
+	docID, err := svc.Enqueue(ctx, IngestInput{KBID: "kb1", Namespace: "ns1", Title: "T", SourceType: SourceTypePaste, Raw: []byte("the quick brown fox jumps over the lazy dog")})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	const n = 8
+	var winners int64
+	var claimErr atomic.Value // error
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	start.Add(1)
+	done.Add(n)
+	for i := 0; i < n; i++ {
+		w := NewWorker(WorkerConfig{Pool: pool, Rag: rag, WorkerID: "w" + string(rune('A'+i)), Lease: time.Minute, MaxAttempts: 5, BaseBackoff: time.Second, Clock: clk.Now})
+		go func() {
+			defer done.Done()
+			start.Wait() // all goroutines released together
+			_, ok, err := w.claim(ctx)
+			if err != nil {
+				claimErr.Store(err)
+				return
+			}
+			if ok {
+				atomic.AddInt64(&winners, 1)
+			}
+		}()
+	}
+	start.Done() // release the herd
+	done.Wait()
+
+	if v := claimErr.Load(); v != nil {
+		t.Fatalf("concurrent claim error: %v", v.(error))
+	}
+	if winners != 1 {
+		t.Fatalf("winners=%d want exactly 1 (FOR UPDATE SKIP LOCKED must prevent double-claim)", winners)
+	}
+	// The single winner left the job 'running' with attempts=1.
+	if state, attempts := jobState(t, ctx, pool, docID); state != "running" || attempts != 1 {
+		t.Fatalf("after claim: state=%q attempts=%d want running/1", state, attempts)
+	}
+}
+
+// TestEnqueueDedupConcurrentIdenticalSingleJob proves F4(a): two identical
+// enqueues collide on UNIQUE(idempotency_key) so only ONE document+job is
+// created and the second returns the first's id (genuine transactional dedup).
+func TestEnqueueDedupConcurrentIdenticalSingleJob(t *testing.T) {
+	ctx := context.Background()
+	pool, _, svc, _ := freshWorkerDB(t, ctx)
+	in := IngestInput{KBID: "kb1", Namespace: "ns1", Title: "T", SourceType: SourceTypePaste, Raw: []byte("identical body for dedup")}
+
+	id1, err := svc.Enqueue(ctx, in)
+	if err != nil {
+		t.Fatalf("Enqueue #1: %v", err)
+	}
+	// Second identical enqueue: the checksum short-circuit can't match (doc is
+	// still 'pending', short-circuit only matches 'ready'), so it reaches the job
+	// INSERT and must hit the unique-violation path → returns the existing id.
+	id2, err := svc.Enqueue(ctx, in)
+	if err != nil {
+		t.Fatalf("Enqueue #2 (dedup path): %v", err)
+	}
+	if id1 != id2 {
+		t.Fatalf("dedup: id2=%q want same as id1=%q", id2, id1)
+	}
+	var docs, jobs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM document WHERE kb_id='kb1'`).Scan(&docs); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingest_job`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if docs != 1 || jobs != 1 {
+		t.Fatalf("after dedup: docs=%d jobs=%d want 1/1", docs, jobs)
 	}
 }
 

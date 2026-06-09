@@ -166,7 +166,9 @@ func (w *Worker) claim(ctx context.Context) (claimed, bool, error) {
 // (the URL is in sourceRef).
 func (w *Worker) loadRaw(ctx context.Context, docID string) []byte {
 	var raw []byte
-	_ = w.cfg.Pool.QueryRow(ctx, `SELECT content FROM document WHERE id=$1`, docID).Scan(&raw)
+	if err := w.cfg.Pool.QueryRow(ctx, `SELECT content FROM document WHERE id=$1`, docID).Scan(&raw); err != nil {
+		w.cfg.Logger.Warn("ingest: load raw content failed", "doc", docID, "err", err)
+	}
 	return raw
 }
 
@@ -183,16 +185,36 @@ func (w *Worker) process(ctx context.Context, c claimed) {
 			Namespace: c.namespace, ReplaceSource: true,
 		})
 		if perr == nil {
+			// Atomic success path: the document→ready and ingest_job→done writes
+			// must commit together. Two separate Execs left a crash window where
+			// the job stayed 'running' after a successful Import and would be
+			// re-imported on reclaim (harmless via ReplaceSource, but wasteful).
 			// Persist checksum so the dedup short-circuit (Enqueue) can match;
 			// null out content so the raw bytes are not retained after indexing
 			// (content_bytes still drives the quota; content is only needed for
 			// the async parse/retry window).
-			_, _ = w.cfg.Pool.Exec(ctx,
+			tx, err := w.cfg.Pool.Begin(ctx)
+			if err != nil {
+				w.cfg.Logger.Error("ingest: begin success tx failed", "job", c.jobID, "err", err)
+				return
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if _, err := tx.Exec(ctx,
 				`UPDATE document SET status='ready', phase='ready', chunk_count=$2, checksum=$3, error='', content=NULL WHERE id=$1`,
-				c.docID, res.Chunks, checksum(text))
-			_, _ = w.cfg.Pool.Exec(ctx,
+				c.docID, res.Chunks, checksum(text)); err != nil {
+				w.cfg.Logger.Error("ingest: mark ready failed", "doc", c.docID, "err", err)
+				return
+			}
+			if _, err := tx.Exec(ctx,
 				`UPDATE ingest_job SET state='done', phase='ready', locked_by='', locked_until=NULL, updated_at=now() WHERE id=$1`,
-				c.jobID)
+				c.jobID); err != nil {
+				w.cfg.Logger.Error("ingest: mark job done failed", "job", c.jobID, "err", err)
+				return
+			}
+			if err := tx.Commit(ctx); err != nil {
+				w.cfg.Logger.Error("ingest: commit success tx failed", "job", c.jobID, "err", err)
+				return
+			}
 			return
 		}
 	}
@@ -200,8 +222,12 @@ func (w *Worker) process(ctx context.Context, c claimed) {
 }
 
 func (w *Worker) setPhase(ctx context.Context, docID, jobID, phase string) {
-	_, _ = w.cfg.Pool.Exec(ctx, `UPDATE document SET phase=$2 WHERE id=$1`, docID, phase)
-	_, _ = w.cfg.Pool.Exec(ctx, `UPDATE ingest_job SET phase=$2, updated_at=now() WHERE id=$1`, jobID, phase)
+	if _, err := w.cfg.Pool.Exec(ctx, `UPDATE document SET phase=$2 WHERE id=$1`, docID, phase); err != nil {
+		w.cfg.Logger.Error("ingest: set document phase failed", "doc", docID, "phase", phase, "err", err)
+	}
+	if _, err := w.cfg.Pool.Exec(ctx, `UPDATE ingest_job SET phase=$2, updated_at=now() WHERE id=$1`, jobID, phase); err != nil {
+		w.cfg.Logger.Error("ingest: set job phase failed", "job", jobID, "phase", phase, "err", err)
+	}
 }
 
 // fail either reschedules the job with exponential backoff (attempts < max) or
@@ -212,18 +238,26 @@ func (w *Worker) fail(ctx context.Context, c claimed, cause error) {
 		msg = cause.Error()
 	}
 	if c.attempts >= w.cfg.MaxAttempts {
-		_, _ = w.cfg.Pool.Exec(ctx,
+		if _, err := w.cfg.Pool.Exec(ctx,
 			`UPDATE ingest_job SET state='dead', last_error=$2, locked_by='', locked_until=NULL, updated_at=now() WHERE id=$1`,
-			c.jobID, msg)
-		_, _ = w.cfg.Pool.Exec(ctx,
-			`UPDATE document SET status='failed', phase='failed', error=$2 WHERE id=$1`, c.docID, msg)
+			c.jobID, msg); err != nil {
+			w.cfg.Logger.Error("ingest: mark job dead failed", "job", c.jobID, "err", err)
+		}
+		if _, err := w.cfg.Pool.Exec(ctx,
+			`UPDATE document SET status='failed', phase='failed', error=$2 WHERE id=$1`, c.docID, msg); err != nil {
+			w.cfg.Logger.Error("ingest: mark document failed failed", "doc", c.docID, "err", err)
+		}
 		return
 	}
 	backoff := w.cfg.BaseBackoff * (1 << (c.attempts - 1)) // base * 2^(attempts-1)
 	nextRun := w.cfg.Clock().Add(backoff)
-	_, _ = w.cfg.Pool.Exec(ctx,
+	if _, err := w.cfg.Pool.Exec(ctx,
 		`UPDATE ingest_job SET state='pending', next_run_at=$2, last_error=$3, locked_by='', locked_until=NULL, updated_at=now() WHERE id=$1`,
-		c.jobID, nextRun, msg)
-	_, _ = w.cfg.Pool.Exec(ctx,
-		`UPDATE document SET status='pending', phase='retry-scheduled', error=$2 WHERE id=$1`, c.docID, msg)
+		c.jobID, nextRun, msg); err != nil {
+		w.cfg.Logger.Error("ingest: reschedule job failed", "job", c.jobID, "err", err)
+	}
+	if _, err := w.cfg.Pool.Exec(ctx,
+		`UPDATE document SET status='pending', phase='retry-scheduled', error=$2 WHERE id=$1`, c.docID, msg); err != nil {
+		w.cfg.Logger.Error("ingest: mark document retry-scheduled failed", "doc", c.docID, "err", err)
+	}
 }
