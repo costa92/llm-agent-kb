@@ -54,8 +54,14 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// Create inserts a kb row and grants the creator admin on the new kb scope,
-// in one transaction. namespace = "kb_" + id so it is unique and stable.
+// Create inserts a kb row, then grants the creator admin on the new kb scope.
+// These are two steps, NOT one transaction: the kb row is committed first, then
+// the membership is written via the authz Store (a separate connection — the
+// authz Store exposes no tx-aware membership method). If the membership write
+// fails after the kb commit, the kb is briefly orphaned (no kb-scope admin);
+// it remains reachable/deletable by the org-level org_admin, and
+// UpsertMembership is idempotent so a retry recovers it. namespace = "kb_" + id
+// so it is unique and stable.
 func (r *Repo) Create(ctx context.Context, in CreateInput) (KB, error) {
 	if in.OrgID == "" || in.Name == "" || in.CreatorUserID == "" {
 		return KB{}, fmt.Errorf("orgkb: OrgID, Name, CreatorUserID required")
