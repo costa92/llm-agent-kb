@@ -1,0 +1,164 @@
+// Package httpapi mounts the kb REST routes (spec §16.2 M1 subset) and wires
+// the RBAC middleware chain over authz. It holds no business rules: it
+// orchestrates auth + limits + JSON only.
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	authzhttp "github.com/costa92/llm-agent-authz/httpapi"
+	authzrole "github.com/costa92/llm-agent-authz/role"
+	authztoken "github.com/costa92/llm-agent-authz/token"
+
+	"github.com/costa92/llm-agent-kb/internal/ingest"
+	"github.com/costa92/llm-agent-kb/internal/limits"
+	"github.com/costa92/llm-agent-kb/internal/orgkb"
+	"github.com/costa92/llm-agent-kb/internal/retrieval"
+)
+
+// Asker is the retrieval surface the ask handler needs (satisfied by *retrieval.Service).
+type Asker interface {
+	Ask(ctx context.Context, in retrieval.AskInput) (retrieval.AskOutput, error)
+}
+
+// OrgLookup resolves a kb's org (satisfied by *orgkb.Repo).
+type OrgLookup interface {
+	OrgIDForKB(ctx context.Context, kbID string) (string, error)
+}
+
+// Ingester is the document-ingest surface (satisfied by *ingest.Service).
+// DeleteAllDocumentsForKB runs the §16.4 cascade over every doc in a kb and is
+// used by the delete-kb handler before the kb row + memberships are removed.
+type Ingester interface {
+	Ingest(ctx context.Context, in ingest.IngestInput) (ingest.Result, error)
+	DeleteDocument(ctx context.Context, namespace, documentID string) error
+	DeleteAllDocumentsForKB(ctx context.Context, namespace, kbID string) error
+}
+
+// Deps are the dependencies NewMux wires together.
+type Deps struct {
+	Issuer       *authztoken.Issuer
+	AuthHandlers *authzhttp.Handlers // /api/auth/*; nil in unit tests that skip auth routes
+	RoleResolver authzhttp.RoleResolver
+	OrgLookup    OrgLookup
+	Asker        Asker
+	Ingester     Ingester
+	KBRepo       *orgkb.Repo // used by kb CRUD handlers; nil in focused unit tests
+	PerUserLimit int
+}
+
+// kbScopeFromRequest builds the ScopeFromRequest closure for kb-scoped routes
+// (path `{id}`): kbID from the path, orgID via the OrgLookup. On a missing kb it
+// returns ("",kbID) which resolves to RoleNone → 403, the safe default.
+func kbScopeFromRequest(lookup OrgLookup) authzhttp.ScopeFromRequest {
+	return func(r *http.Request) (string, string) {
+		kbID := r.PathValue("id")
+		orgID, err := lookup.OrgIDForKB(r.Context(), kbID)
+		if err != nil {
+			return "", kbID
+		}
+		return orgID, kbID
+	}
+}
+
+// orgScopeFromRequest builds the ScopeFromRequest for ORG-scoped routes
+// (path `{org}`): orgID from the path, scopeID="" so ResolveRole(...,"kb","")
+// matches the org-level membership row (`scope_id IS NULL OR scope_id=$4`). An
+// org_admin (rank 4) thus satisfies the kb admin/viewer minimum on these routes.
+func orgScopeFromRequest(r *http.Request) (string, string) {
+	return r.PathValue("org"), ""
+}
+
+// NewMux builds the kb ServeMux with the auth routes and the RBAC-guarded kb routes.
+func NewMux(d Deps) *http.ServeMux {
+	mux := http.NewServeMux()
+	if d.AuthHandlers != nil {
+		d.AuthHandlers.Mount(mux, "/api/auth")
+	}
+	guard := limits.New(d.PerUserLimit)
+	kbScope := kbScopeFromRequest(d.OrgLookup)
+
+	// authOnly composes: Authenticate → per-user limit → handler. No scope role
+	// check — used by POST /api/orgs (any authenticated user may create an org).
+	authOnly := func(h http.HandlerFunc) http.Handler {
+		var handler http.Handler = withUserLimit(guard, h)
+		return authzhttp.Authenticate(d.Issuer)(handler)
+	}
+	// scoped composes: Authenticate → RequireScopeRole(min, scope) → per-user
+	// limit → handler, for an arbitrary ScopeFromRequest.
+	scoped := func(min authzrole.Role, scope authzhttp.ScopeFromRequest, h http.HandlerFunc) http.Handler {
+		var handler http.Handler = withUserLimit(guard, h)
+		handler = authzhttp.RequireScopeRole(d.RoleResolver, "kb", min, scope)(handler)
+		return authzhttp.Authenticate(d.Issuer)(handler)
+	}
+	// chain is the kb-scoped (`{id}`) shorthand.
+	chain := func(min authzrole.Role, h http.HandlerFunc) http.Handler {
+		return scoped(min, kbScope, h)
+	}
+
+	// Org bootstrap + kb create/list (§16.2). Wired only when KBRepo is set.
+	if d.KBRepo != nil {
+		// POST /api/orgs — any authenticated user; creator becomes org_admin.
+		mux.Handle("POST /api/orgs", authOnly(createOrgHandler(d.KBRepo)))
+		// POST/GET /api/orgs/{org}/kbs — org-level RBAC (org_admin satisfies it).
+		mux.Handle("POST /api/orgs/{org}/kbs", scoped(authzrole.RoleAdmin, orgScopeFromRequest, createKBHandler(d.KBRepo)))
+		mux.Handle("GET /api/orgs/{org}/kbs", scoped(authzrole.RoleViewer, orgScopeFromRequest, listKBHandler(d.KBRepo)))
+	}
+
+	// Q&A — viewer+.
+	mux.Handle("POST /api/kb/{id}/ask", chain(authzrole.RoleViewer, askHandler(d.Asker)))
+	// Documents — upload requires editor+, read viewer+, delete editor+.
+	if d.Ingester != nil && d.KBRepo != nil {
+		mux.Handle("POST /api/kb/{id}/documents", chain(authzrole.RoleEditor, uploadHandler(d.KBRepo, d.Ingester)))
+		mux.Handle("DELETE /api/kb/{id}/documents/{docId}", chain(authzrole.RoleEditor, deleteDocHandler(d.KBRepo, d.Ingester)))
+		// kb resource — delete is admin (cascade wired in deleteKBHandler).
+		mux.Handle("GET /api/kb/{id}", chain(authzrole.RoleViewer, getKBHandler(d.KBRepo)))
+		mux.Handle("DELETE /api/kb/{id}", chain(authzrole.RoleAdmin, deleteKBHandler(d.KBRepo, d.Ingester)))
+	}
+	return mux
+}
+
+// withUserLimit enforces the per-user request budget after auth (so UserID is set).
+func withUserLimit(g *limits.Guard, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := authzhttp.UserID(r.Context())
+		if !g.Allow(uid) {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func askHandler(asker Asker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Q    string `json:"q"`
+			Mode string `json:"mode"`
+			TopK int    `json:"topK"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		out, err := asker.Ask(r.Context(), retrieval.AskInput{
+			Namespace: "kb_" + r.PathValue("id"), // namespace = "kb_"+id (orgkb.Create convention)
+			Question:  req.Q,
+			Mode:      req.Mode,
+			TopK:      req.TopK,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}
+}
