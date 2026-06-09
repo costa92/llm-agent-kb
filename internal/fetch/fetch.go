@@ -82,6 +82,12 @@ func New(cfg Config) *Fetcher {
 	return f
 }
 
+// NewLoopbackForTest builds a Fetcher that permits loopback IPs, for tests that
+// must reach an httptest server. NOT for production use.
+func NewLoopbackForTest(timeout time.Duration, maxBytes int64, allowed []string) *Fetcher {
+	return New(Config{Timeout: timeout, MaxBytes: maxBytes, AllowedContentTypes: allowed, allowLoopback: true})
+}
+
 // Get fetches the URL and returns the (capped) body + response media type.
 func (f *Fetcher) Get(ctx context.Context, rawURL string) ([]byte, string, error) {
 	u, err := url.Parse(rawURL)
