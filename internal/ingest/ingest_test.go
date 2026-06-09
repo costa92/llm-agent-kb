@@ -1,18 +1,21 @@
 package ingest
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
 )
 
 func TestParseTXTAndPasteArePlainText(t *testing.T) {
-	got, err := parse(SourceTypeTXT, []byte("line one\nline two"))
+	deps := parseDeps{parseTimeout: time.Second}
+	got, _, err := parseSource(context.Background(), deps, SourceTypeTXT, []byte("line one\nline two"), "")
 	if err != nil || got != "line one\nline two" {
 		t.Fatalf("parse txt=%q,%v", got, err)
 	}
-	got, err = parse(SourceTypePaste, []byte("pasted"))
+	got, _, err = parseSource(context.Background(), deps, SourceTypePaste, []byte("pasted"), "")
 	if err != nil || got != "pasted" {
 		t.Fatalf("parse paste=%q,%v", got, err)
 	}
@@ -20,15 +23,16 @@ func TestParseTXTAndPasteArePlainText(t *testing.T) {
 
 func TestParseMarkdownKeptVerbatim(t *testing.T) {
 	md := "# Title\n\nbody text"
-	got, err := parse(SourceTypeMarkdown, []byte(md))
+	deps := parseDeps{parseTimeout: time.Second}
+	got, _, err := parseSource(context.Background(), deps, SourceTypeMarkdown, []byte(md), "")
 	if err != nil || got != md {
 		t.Fatalf("parse md=%q,%v", got, err)
 	}
 }
 
 func TestParseRejectsUnsupportedType(t *testing.T) {
-	if _, err := parse("pdf", []byte("x")); err == nil {
-		t.Fatal("pdf is M2 — must be rejected in M1")
+	if _, _, err := parseSource(context.Background(), parseDeps{}, SourceType("bogus"), []byte("x"), ""); err == nil {
+		t.Fatal("unknown source type must error")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -15,26 +16,6 @@ import (
 
 	"github.com/costa92/llm-agent-kb/internal/ragsvc"
 )
-
-// SourceType is the M1 set of accepted document source types. PDF/DOCX/URL are M2.
-type SourceType string
-
-const (
-	SourceTypeMarkdown SourceType = "markdown"
-	SourceTypeTXT      SourceType = "txt"
-	SourceTypePaste    SourceType = "paste"
-)
-
-// parse converts raw bytes to text for an M1 source type. MD/TXT/paste are all
-// treated as text (the rag splitter handles markdown structure downstream).
-func parse(st SourceType, raw []byte) (string, error) {
-	switch st {
-	case SourceTypeMarkdown, SourceTypeTXT, SourceTypePaste:
-		return string(raw), nil
-	default:
-		return "", fmt.Errorf("ingest: unsupported source_type %q (M1 supports markdown/txt/paste)", st)
-	}
-}
 
 func checksum(content string) string {
 	sum := sha256.Sum256([]byte(content))
@@ -90,7 +71,8 @@ type Result struct {
 // document ready. On parse/import failure the row is marked failed with the
 // error recorded.
 func (s *Service) Ingest(ctx context.Context, in IngestInput) (Result, error) {
-	content, err := parse(in.SourceType, in.Raw)
+	deps := parseDeps{parseTimeout: 30 * time.Second}
+	content, _, err := parseSource(ctx, deps, in.SourceType, in.Raw, "")
 	if err != nil {
 		return Result{}, err
 	}
