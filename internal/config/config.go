@@ -14,7 +14,7 @@ const (
 	ProviderOllama = "ollama"
 )
 
-// Config is the kbd runtime configuration (M1 fields only).
+// Config is the kbd runtime configuration (M1 + M2 fields).
 type Config struct {
 	HTTPAddr string
 
@@ -36,6 +36,22 @@ type Config struct {
 
 	MaxAskTokens                int // per-Ask cumulative token budget (rag AskOptions.MaxTotalTokens)
 	MaxRequestsPerUserPerMinute int // per-user fixed-window cap on ask/upload
+
+	// M2 ingest worker pool.
+	IngestWorkers      int           // number of concurrent worker goroutines
+	IngestPollInterval time.Duration // queue poll interval when idle
+	IngestLease        time.Duration // job lease (locked_until = now + lease); stuck jobs reclaimed past it
+	IngestMaxAttempts  int           // attempts before a job becomes 'dead'
+	IngestBaseBackoff  time.Duration // base for exponential backoff (next_run_at = now + base*2^attempts)
+
+	// M2 upload / parse safety (§16.3).
+	MaxUploadBytes      int64         // http.MaxBytesReader cap per document body
+	KBStorageQuotaBytes int64         // per-kb cumulative byte quota (sum of document content sizes)
+	ParseTimeout        time.Duration // context deadline around PDF/DOCX parse (anti parse-bomb)
+
+	// M2 SSRF-safe URL fetch (§16.3).
+	FetchTimeout  time.Duration // connect+read deadline for outbound URL ingest
+	FetchMaxBytes int64         // max response body bytes for outbound URL ingest
 
 	ServiceName  string
 	OTLPEndpoint string
@@ -66,6 +82,16 @@ func LoadFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		RefreshTTL:                  time.Duration(envInt(lookup, "REFRESH_TTL_HOURS", 720)) * time.Hour,
 		MaxAskTokens:                envInt(lookup, "MAX_ASK_TOKENS", 4096),
 		MaxRequestsPerUserPerMinute: envInt(lookup, "MAX_REQUESTS_PER_USER_PER_MINUTE", 30),
+		IngestWorkers:               envInt(lookup, "INGEST_WORKERS", 2),
+		IngestPollInterval:          time.Duration(envInt(lookup, "INGEST_POLL_INTERVAL_SECONDS", 2)) * time.Second,
+		IngestLease:                 time.Duration(envInt(lookup, "INGEST_LEASE_SECONDS", 60)) * time.Second,
+		IngestMaxAttempts:           envInt(lookup, "INGEST_MAX_ATTEMPTS", 5),
+		IngestBaseBackoff:           time.Duration(envInt(lookup, "INGEST_BASE_BACKOFF_SECONDS", 5)) * time.Second,
+		MaxUploadBytes:              int64(envInt(lookup, "MAX_UPLOAD_BYTES", 10<<20)),
+		KBStorageQuotaBytes:         int64(envInt(lookup, "KB_STORAGE_QUOTA_BYTES", 256<<20)),
+		ParseTimeout:                time.Duration(envInt(lookup, "PARSE_TIMEOUT_SECONDS", 30)) * time.Second,
+		FetchTimeout:                time.Duration(envInt(lookup, "FETCH_TIMEOUT_SECONDS", 15)) * time.Second,
+		FetchMaxBytes:               int64(envInt(lookup, "FETCH_MAX_BYTES", 10<<20)),
 		ServiceName:                 envOr(lookup, "OTEL_SERVICE_NAME", "llm-agent-kb"),
 		OTLPEndpoint:                envOr(lookup, "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
 		OTLPProtocol:                strings.ToLower(envOr(lookup, "OTEL_EXPORTER_OTLP_PROTOCOL", "http")),
