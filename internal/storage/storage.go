@@ -33,6 +33,12 @@ func Open(ctx context.Context, cfg Config) (*Storage, error) {
 	if cfg.EmbeddingDim <= 0 {
 		return nil, fmt.Errorf("storage: EmbeddingDim must be > 0")
 	}
+	// Bootstrap the pgvector extension on a plain connection (no codec
+	// registration) so the typed pool's AfterConnect=RegisterTypes can find
+	// the vector type on every connection during cold-start.
+	if err := ensureVectorExtension(ctx, cfg.PGURL); err != nil {
+		return nil, err
+	}
 	poolCfg, err := pgxpool.ParseConfig(cfg.PGURL)
 	if err != nil {
 		return nil, fmt.Errorf("storage: parse dsn: %w", err)
@@ -54,6 +60,21 @@ func Open(ctx context.Context, cfg Config) (*Storage, error) {
 		return nil, fmt.Errorf("storage: rag store: %w", err)
 	}
 	return &Storage{pool: pool, ragStore: ragStore}, nil
+}
+
+// ensureVectorExtension creates the pgvector extension on a plain connection
+// that does NOT register the vector codec, so the typed pool (whose
+// AfterConnect registers types) can find the vector type on cold-start.
+func ensureVectorExtension(ctx context.Context, dsn string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("storage: bootstrap connect: %w", err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+		return fmt.Errorf("storage: create vector extension: %w", err)
+	}
+	return nil
 }
 
 // Pool returns the underlying pgxpool.
