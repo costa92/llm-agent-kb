@@ -108,9 +108,14 @@ func (f *Fetcher) Get(ctx context.Context, rawURL string) ([]byte, string, error
 	if !f.contentTypeAllowed(ct) {
 		return nil, "", fmt.Errorf("fetch: content-type %q not allowed", ct)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, f.cfg.MaxBytes))
+	// Read one byte past the cap so we can distinguish "exactly at cap" from
+	// "over cap" and reject oversized bodies instead of silently truncating.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, f.cfg.MaxBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch: read body: %w", err)
+	}
+	if int64(len(body)) > f.cfg.MaxBytes {
+		return nil, "", fmt.Errorf("fetch: response exceeds %d bytes", f.cfg.MaxBytes)
 	}
 	return body, ct, nil
 }
