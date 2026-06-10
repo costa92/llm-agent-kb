@@ -6,9 +6,26 @@ import (
 )
 
 // DeleteDocument removes a document and its chunks/graph contributions in the
-// strict §16.4 order, then deletes the document row. The RemoveGraphBySource
-// call is a no-op in M1 (no graph) but kept to honor the contract.
+// strict §16.4 order, then deletes the document row, then recomputes the
+// namespace's communities over the now-reduced graph (§16.4: Louvain is
+// full-namespace, there is no per-source community delete).
 func (s *Service) DeleteDocument(ctx context.Context, namespace, documentID string) error {
+	if err := s.deleteDocumentChunksAndRow(ctx, namespace, documentID); err != nil {
+		return err
+	}
+	// §16.4: communities cannot be deleted per-source; recompute the namespace's
+	// community set over the now-reduced graph + refresh reports.
+	if err := s.rag.RecomputeCommunities(ctx, namespace); err != nil {
+		return fmt.Errorf("ingest: recompute communities: %w", err)
+	}
+	return nil
+}
+
+// deleteDocumentChunksAndRow runs the strict §16.4 delete cascade WITHOUT the
+// community recompute (List→RemoveGraphBySource→RemoveChunks→delete row). The
+// RemoveGraphBySource call is a no-op in M1 (no graph) but kept to honor the
+// contract. Recompute is the caller's responsibility (once per kb cascade).
+func (s *Service) deleteDocumentChunksAndRow(ctx context.Context, namespace, documentID string) error {
 	// 1. Collect chunk IDs BEFORE removal (RemoveByFilter returns only a count).
 	ids, err := s.rag.ListChunkIDs(ctx, namespace, documentID)
 	if err != nil {
@@ -50,9 +67,13 @@ func (s *Service) DeleteAllDocumentsForKB(ctx context.Context, namespace, kbID s
 		return err
 	}
 	for _, id := range docIDs {
-		if err := s.DeleteDocument(ctx, namespace, id); err != nil {
+		if err := s.deleteDocumentChunksAndRow(ctx, namespace, id); err != nil {
 			return err
 		}
+	}
+	// §16.4: one recompute after the whole kb cascade (not per-document).
+	if err := s.rag.RecomputeCommunities(ctx, namespace); err != nil {
+		return fmt.Errorf("ingest: recompute communities: %w", err)
 	}
 	return nil
 }

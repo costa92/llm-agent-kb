@@ -13,6 +13,10 @@ import (
 type Config struct {
 	MaxAskTokens int // → rag AskOptions.MaxTotalTokens
 	SnippetChars int // citation snippet length; <=0 defaults to 240
+
+	GlobalMaxCommunities int // GlobalOptions.MaxCommunities when the request omits it
+	DriftRounds          int // DriftOptions.Rounds default
+	DriftTopK            int // DriftOptions.TopK default
 }
 
 // AskInput is the kb-side ask input.
@@ -101,6 +105,85 @@ func (s *Service) Ask(ctx context.Context, in AskInput) (AskOutput, error) {
 		Diagnostics: map[string]any{
 			"mode":     in.Mode,
 			"hitCount": ans.Diagnostics.HitCount,
+		},
+	}, nil
+}
+
+// GlobalInput is the kb-side AskGlobal input (spec §7). Isolation is
+// Namespace-ONLY (§8) — no SecurityFilters on the global path.
+type GlobalInput struct {
+	Namespace      string
+	Question       string
+	MaxCommunities int
+}
+
+// DriftInput is the kb-side AskDrift input (spec §7). Namespace-only (§8).
+type DriftInput struct {
+	Namespace      string
+	Question       string
+	MaxCommunities int
+	Rounds         int
+	TopK           int
+}
+
+// AskGlobal runs GraphRAG global map-reduce. The Answer carries no Citations
+// (global answers are community-level), so AskOutput.Citations is empty.
+func (s *Service) AskGlobal(ctx context.Context, in GlobalInput) (AskOutput, error) {
+	maxC := in.MaxCommunities
+	if maxC <= 0 {
+		maxC = s.cfg.GlobalMaxCommunities
+	}
+	ans, err := s.rag.AskGlobal(ctx, in.Question, ragsvc.GlobalRequest{
+		Namespace:      in.Namespace,
+		MaxCommunities: maxC,
+		MaxTotalTokens: s.cfg.MaxAskTokens,
+	})
+	if err != nil {
+		return AskOutput{}, err
+	}
+	return AskOutput{
+		Answer:    ans.Text,
+		Citations: []Citation{},
+		Diagnostics: map[string]any{
+			"mode":         "global",
+			"communityIds": ans.Diagnostics.Global.CommunityIDs,
+			"mapCalls":     ans.Diagnostics.Global.MapCalls,
+			"reduceCalls":  ans.Diagnostics.Global.ReduceCalls,
+		},
+	}, nil
+}
+
+// AskDrift runs GraphRAG drift (global primer + local follow-up). No Citations.
+func (s *Service) AskDrift(ctx context.Context, in DriftInput) (AskOutput, error) {
+	rounds := in.Rounds
+	if rounds <= 0 {
+		rounds = s.cfg.DriftRounds
+	}
+	topK := in.TopK
+	if topK <= 0 {
+		topK = s.cfg.DriftTopK
+	}
+	maxC := in.MaxCommunities
+	if maxC <= 0 {
+		maxC = s.cfg.GlobalMaxCommunities
+	}
+	ans, err := s.rag.AskDrift(ctx, in.Question, ragsvc.DriftRequest{
+		Namespace:      in.Namespace,
+		MaxCommunities: maxC,
+		Rounds:         rounds,
+		TopK:           topK,
+		MaxTotalTokens: s.cfg.MaxAskTokens,
+	})
+	if err != nil {
+		return AskOutput{}, err
+	}
+	return AskOutput{
+		Answer:    ans.Text,
+		Citations: []Citation{},
+		Diagnostics: map[string]any{
+			"mode":               "drift",
+			"primerCommunityIds": ans.Diagnostics.Drift.PrimerCommunityIDs,
+			"rounds":             ans.Diagnostics.Drift.Rounds,
 		},
 	}, nil
 }

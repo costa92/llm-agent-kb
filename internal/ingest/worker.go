@@ -215,6 +215,13 @@ func (w *Worker) process(ctx context.Context, c claimed) {
 				w.cfg.Logger.Error("ingest: commit success tx failed", "job", c.jobID, "err", err)
 				return
 			}
+			// M3: community reports are lazy; prewarm so the first AskGlobal is
+			// all-cache-hits (§6 step 4). Best-effort — the doc is already
+			// 'ready' and communities are detected during Import; a prewarm
+			// failure is logged, never re-fails the job.
+			if _, perr := w.cfg.Rag.PrewarmCommunityReports(ctx, c.namespace); perr != nil {
+				w.cfg.Logger.Warn("ingest: prewarm community reports failed", "namespace", c.namespace, "err", perr)
+			}
 			return
 		}
 	}

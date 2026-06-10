@@ -284,6 +284,55 @@ func TestEnqueueDedupConcurrentIdenticalSingleJob(t *testing.T) {
 	}
 }
 
+// prewarmRecorder wraps a RagPort and records PrewarmCommunityReports calls.
+type prewarmRecorder struct {
+	ragsvc.RagPort
+	mu        sync.Mutex
+	prewarmed []string
+}
+
+func (r *prewarmRecorder) PrewarmCommunityReports(ctx context.Context, ns string) (int, error) {
+	r.mu.Lock()
+	r.prewarmed = append(r.prewarmed, ns)
+	r.mu.Unlock()
+	return 0, nil
+}
+
+func TestWorkerPrewarmsAfterImport(t *testing.T) {
+	ctx := context.Background()
+	pool, rag, svc, clk := freshWorkerDB(t, ctx)
+	// Insert a second kb with namespace kb_testkb so we can assert the
+	// correct namespace is passed to PrewarmCommunityReports.
+	if _, err := pool.Exec(ctx, `INSERT INTO knowledge_base (id, org_id, name, namespace) VALUES ('kb2','o1','KB2','kb_testkb')`); err != nil {
+		t.Fatal(err)
+	}
+	docID, err := svc.Enqueue(ctx, IngestInput{
+		KBID:       "kb2",
+		Namespace:  "kb_testkb",
+		Title:      "T",
+		SourceType: SourceTypePaste,
+		Raw:        []byte("the quick brown fox jumps over the lazy dog for prewarm test"),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	rec := &prewarmRecorder{RagPort: rag}
+	w := NewWorker(WorkerConfig{Pool: pool, Rag: rec, WorkerID: "t", Lease: time.Minute, MaxAttempts: 3, BaseBackoff: time.Second, Clock: clk.Now})
+	ok, runErr := w.RunOnce(ctx)
+	if runErr != nil || !ok {
+		t.Fatalf("RunOnce ok=%v err=%v", ok, runErr)
+	}
+	// The document must be ready (prewarm failure must not flip it to failed).
+	if status, _ := docStatus(t, ctx, pool, docID); status != "ready" {
+		t.Fatalf("doc status=%q want ready", status)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.prewarmed) != 1 || rec.prewarmed[0] != "kb_testkb" {
+		t.Fatalf("expected one prewarm for kb_testkb, got %v", rec.prewarmed)
+	}
+}
+
 // clock is an injectable monotonic-ish clock for deterministic worker tests.
 type clock struct{ now time.Time }
 

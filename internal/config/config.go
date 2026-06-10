@@ -53,6 +53,15 @@ type Config struct {
 	FetchTimeout  time.Duration // connect+read deadline for outbound URL ingest
 	FetchMaxBytes int64         // max response body bytes for outbound URL ingest
 
+	// M3 GraphRAG (§13 M3, §6 step 4, §7).
+	GraphEnabled            bool    // wire EntityExtractor/Louvain/Summarizer into rag.New (default true)
+	LouvainResolution       float64 // graph.LouvainDetector.Resolution; <=0 → 1.0
+	EntityResolverEnabled   bool    // opt-in near-dup entity merge (graph.EmbeddingEntityResolver)
+	EntityResolverThreshold float64 // resolver cosine-similarity threshold; <=0 → rag default
+	GlobalMaxCommunities    int     // GlobalOptions.MaxCommunities default (also DriftOptions.MaxCommunities)
+	DriftRounds             int     // DriftOptions.Rounds default
+	DriftTopK               int     // DriftOptions.TopK default
+
 	ServiceName  string
 	OTLPEndpoint string
 	OTLPProtocol string
@@ -92,6 +101,13 @@ func LoadFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		ParseTimeout:                time.Duration(envInt(lookup, "PARSE_TIMEOUT_SECONDS", 30)) * time.Second,
 		FetchTimeout:                time.Duration(envInt(lookup, "FETCH_TIMEOUT_SECONDS", 15)) * time.Second,
 		FetchMaxBytes:               int64(envInt(lookup, "FETCH_MAX_BYTES", 10<<20)),
+		GraphEnabled:                envBool(lookup, "GRAPH_ENABLED", true),
+		LouvainResolution:           envFloat(lookup, "LOUVAIN_RESOLUTION", 1.0),
+		EntityResolverEnabled:       envBool(lookup, "ENTITY_RESOLVER_ENABLED", false),
+		EntityResolverThreshold:     envFloat(lookup, "ENTITY_RESOLVER_THRESHOLD", 0),
+		GlobalMaxCommunities:        envInt(lookup, "GLOBAL_MAX_COMMUNITIES", 8),
+		DriftRounds:                 envInt(lookup, "DRIFT_ROUNDS", 2),
+		DriftTopK:                   envInt(lookup, "DRIFT_TOP_K", 5),
 		ServiceName:                 envOr(lookup, "OTEL_SERVICE_NAME", "llm-agent-kb"),
 		OTLPEndpoint:                envOr(lookup, "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
 		OTLPProtocol:                strings.ToLower(envOr(lookup, "OTEL_EXPORTER_OTLP_PROTOCOL", "http")),
@@ -150,6 +166,15 @@ func envBool(lookup func(string) (string, bool), key string, def bool) bool {
 	if v, ok := lookup(key); ok {
 		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
 			return b
+		}
+	}
+	return def
+}
+
+func envFloat(lookup func(string) (string, bool), key string, def float64) float64 {
+	if v, ok := lookup(key); ok {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return f
 		}
 	}
 	return def
