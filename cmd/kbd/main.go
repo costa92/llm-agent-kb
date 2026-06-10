@@ -96,15 +96,32 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 		return nil, nil, err
 	}
 
+	var graphComps ragsvc.GraphComponents
+	if cfg.GraphEnabled {
+		graphComps = ragsvc.NewLLMGraphComponents(model, embedder, ragsvc.GraphConfig{
+			LouvainResolution: cfg.LouvainResolution,
+			ResolverEnabled:   cfg.EntityResolverEnabled,
+			ResolverThreshold: cfg.EntityResolverThreshold,
+		})
+	}
 	rag := ragsvc.New(ragsvc.Deps{
 		Model: model, Embedder: embedder,
 		RagStore: st.RagStore(), ChunkStore: st.RagStore(),
-		Tracer: tp,
+		Tracer:              tp,
+		EntityExtractor:     graphComps.EntityExtractor,
+		EntityResolver:      graphComps.EntityResolver,
+		CommunityDetector:   graphComps.CommunityDetector,
+		CommunitySummarizer: graphComps.CommunitySummarizer,
 	})
 
 	kbRepo := orgkb.New(st.Pool(), az)
 	ingestSvc := ingest.New(st.Pool(), rag)
-	retrievalSvc := retrieval.New(rag, retrieval.Config{MaxAskTokens: cfg.MaxAskTokens})
+	retrievalSvc := retrieval.New(rag, retrieval.Config{
+		MaxAskTokens:         cfg.MaxAskTokens,
+		GlobalMaxCommunities: cfg.GlobalMaxCommunities,
+		DriftRounds:          cfg.DriftRounds,
+		DriftTopK:            cfg.DriftTopK,
+	})
 
 	fetcher := fetch.New(fetch.Config{
 		Timeout:             cfg.FetchTimeout,
@@ -137,6 +154,7 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 		RoleResolver: az, // *store.Store satisfies authzhttp.RoleResolver
 		OrgLookup:    kbRepo,
 		Asker:        retrievalSvc,
+		Community:    rag, // *ragsvc.Service satisfies httpapi.CommunityReader
 		Ingester:     ingestSvc,
 		KBRepo:       kbRepo,
 		PerUserLimit: cfg.MaxRequestsPerUserPerMinute,

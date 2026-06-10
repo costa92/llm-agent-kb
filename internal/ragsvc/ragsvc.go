@@ -300,3 +300,39 @@ func (s *Service) CommunityReport(ctx context.Context, namespace, communityID st
 	}
 	return CommunityReportView{ID: rep.CommunityID, Title: rep.Title, Summary: rep.Summary}, true, nil
 }
+
+// GraphConfig selects the production GraphRAG component parameters.
+type GraphConfig struct {
+	LouvainResolution float64
+	ResolverEnabled   bool
+	ResolverThreshold float64
+}
+
+// GraphComponents bundles the rag/graph seams cmd/kbd passes into Deps. Keeping
+// the raggraph types behind this constructor means cmd/kbd never imports
+// rag/graph directly (boundary: ragsvc is the sole importer of rag/*).
+type GraphComponents struct {
+	EntityExtractor     raggraph.EntityExtractor
+	EntityResolver      raggraph.EntityResolver
+	CommunityDetector   raggraph.CommunityDetector
+	CommunitySummarizer raggraph.CommunitySummarizer
+}
+
+// NewLLMGraphComponents builds the production GraphRAG components over the given
+// chat model + embedder, honoring the resolver toggle. cmd/kbd calls this so it
+// never imports rag/graph directly. A disabled resolver leaves EntityResolver
+// nil — rag then defaults to its NoopEntityResolver.
+func NewLLMGraphComponents(model llm.ChatModel, embedder llm.Embedder, opts GraphConfig) GraphComponents {
+	gc := GraphComponents{
+		EntityExtractor:     raggraph.LLMEntityExtractor{Model: ragModelAdapter{inner: model}},
+		CommunityDetector:   raggraph.LouvainDetector{Resolution: opts.LouvainResolution},
+		CommunitySummarizer: raggraph.LLMCommunitySummarizer{Model: ragModelAdapter{inner: model}},
+	}
+	if opts.ResolverEnabled {
+		gc.EntityResolver = raggraph.EmbeddingEntityResolver{
+			Embedder:  ragEmbedderAdapter{inner: embedder},
+			Threshold: opts.ResolverThreshold,
+		}
+	}
+	return gc
+}

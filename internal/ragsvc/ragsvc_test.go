@@ -261,3 +261,19 @@ func (fixedSummarizer) Summarize(_ context.Context, c raggraph.Community, _ ragg
 		ContentHash: raggraph.CommunityContentHash(c),
 	}, nil
 }
+
+func TestNewLLMGraphComponentsHonorsResolverToggle(t *testing.T) {
+	model := llm.NewScriptedLLM(llm.WithResponses(llm.TextResponse("unused")))
+	embedder := llm.NewScriptedLLM(llm.WithEmbedDimensions(8))
+	off := NewLLMGraphComponents(model, embedder, GraphConfig{LouvainResolution: 1.0, ResolverEnabled: false})
+	if off.EntityExtractor == nil || off.CommunityDetector == nil || off.CommunitySummarizer == nil {
+		t.Fatal("core components must be non-nil")
+	}
+	if off.EntityResolver != nil {
+		t.Fatal("resolver disabled → EntityResolver must be nil (rag defaults to Noop)")
+	}
+	on := NewLLMGraphComponents(model, embedder, GraphConfig{LouvainResolution: 1.5, ResolverEnabled: true, ResolverThreshold: 0.9})
+	if on.EntityResolver == nil {
+		t.Fatal("resolver enabled → EntityResolver must be set")
+	}
+}
