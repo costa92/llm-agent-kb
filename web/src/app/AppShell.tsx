@@ -24,3 +24,21 @@ export function AppShell() {
     </div>
   )
 }
+
+export function KbTabs({ kbId }: { kbId: string }) {
+  const linkCls = "rounded px-3 py-1.5 text-sm hover:bg-accent"
+  return (
+    <nav className="flex gap-1 border-b pb-2">
+      <Link to="/kb/$kbId/documents" params={{ kbId }} className={linkCls}>
+        Documents
+      </Link>
+      {/* ask/eval/sessions routes land in later tasks; cast until they exist in the route tree. */}
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+      <Link {...({ to: "/kb/$kbId/ask", params: { kbId }, className: linkCls } as any)}>Ask</Link>
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+      <Link {...({ to: "/kb/$kbId/eval", params: { kbId }, className: linkCls } as any)}>Eval</Link>
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+      <Link {...({ to: "/kb/$kbId/sessions", params: { kbId }, className: linkCls } as any)}>Sessions</Link>
+    </nav>
+  )
+}
