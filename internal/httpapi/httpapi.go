@@ -15,12 +15,24 @@ import (
 	"github.com/costa92/llm-agent-kb/internal/ingest"
 	"github.com/costa92/llm-agent-kb/internal/limits"
 	"github.com/costa92/llm-agent-kb/internal/orgkb"
+	"github.com/costa92/llm-agent-kb/internal/ragsvc"
 	"github.com/costa92/llm-agent-kb/internal/retrieval"
 )
 
-// Asker is the retrieval surface the ask handler needs (satisfied by *retrieval.Service).
+// Asker is the retrieval surface the ask handlers need (satisfied by
+// *retrieval.Service). AskGlobal/AskDrift back the GraphRAG endpoints (M3).
 type Asker interface {
 	Ask(ctx context.Context, in retrieval.AskInput) (retrieval.AskOutput, error)
+	AskGlobal(ctx context.Context, in retrieval.GlobalInput) (retrieval.AskOutput, error)
+	AskDrift(ctx context.Context, in retrieval.DriftInput) (retrieval.AskOutput, error)
+}
+
+// CommunityReader reads the GraphRAG community views (satisfied by
+// *ragsvc.Service). Returns kb-local DTOs, NOT rag/graph types — so httpapi
+// never imports rag/graph (spec §4: ragsvc is the sole rag/graph importer).
+type CommunityReader interface {
+	ListCommunities(ctx context.Context, namespace string) ([]ragsvc.CommunityView, error)
+	CommunityReport(ctx context.Context, namespace, communityID string) (ragsvc.CommunityReportView, bool, error)
 }
 
 // OrgLookup resolves a kb's org (satisfied by *orgkb.Repo).
@@ -61,6 +73,7 @@ type Deps struct {
 	RoleResolver authzhttp.RoleResolver
 	OrgLookup    OrgLookup
 	Asker        Asker
+	Community    CommunityReader // GraphRAG community views (M3); nil disables those routes
 	Ingester     Ingester
 	KBRepo       *orgkb.Repo // used by kb CRUD handlers; nil in focused unit tests
 	PerUserLimit int
@@ -130,10 +143,19 @@ func NewMux(d Deps) *http.ServeMux {
 
 	// Q&A — viewer+.
 	mux.Handle("POST /api/kb/{id}/ask", chain(authzrole.RoleViewer, askHandler(d.Asker)))
+	// GraphRAG Q&A (M3) — global map-reduce + drift; viewer+, namespace-only.
+	mux.Handle("POST /api/kb/{id}/ask/global", chain(authzrole.RoleViewer, askGlobalHandler(d.Asker)))
+	mux.Handle("POST /api/kb/{id}/ask/drift", chain(authzrole.RoleViewer, askDriftHandler(d.Asker)))
+	// Community views (M3) — viewer+; wired only when a CommunityReader + KBRepo are set.
+	if d.Community != nil && d.KBRepo != nil {
+		mux.Handle("GET /api/kb/{id}/communities", chain(authzrole.RoleViewer, listCommunitiesHandler(d.KBRepo, d.Community)))
+		mux.Handle("GET /api/kb/{id}/communities/{cid}", chain(authzrole.RoleViewer, communityReportHandler(d.KBRepo, d.Community)))
+	}
 	// Documents — upload requires editor+, read viewer+, delete editor+.
 	if d.Ingester != nil && d.KBRepo != nil {
 		mux.Handle("POST /api/kb/{id}/documents", chain(authzrole.RoleEditor, uploadHandler(d.KBRepo, d.Ingester, d.MaxUploadBytes, d.KBStorageQuotaBytes)))
 		mux.Handle("GET /api/kb/{id}/documents", chain(authzrole.RoleViewer, listDocsHandler(d.KBRepo, d.Ingester)))
+		mux.Handle("GET /api/kb/{id}/documents/{docId}", chain(authzrole.RoleViewer, getDocHandler(d.KBRepo, d.DocStatus)))
 		mux.Handle("GET /api/kb/{id}/documents/{docId}/progress", chain(authzrole.RoleViewer, progressHandler(d.KBRepo, d.DocStatus)))
 		mux.Handle("POST /api/kb/{id}/documents/{docId}/retry", chain(authzrole.RoleEditor, retryHandler(d.KBRepo, d.Ingester)))
 		mux.Handle("DELETE /api/kb/{id}/documents/{docId}", chain(authzrole.RoleEditor, deleteDocHandler(d.KBRepo, d.Ingester)))
@@ -178,6 +200,59 @@ func askHandler(asker Asker) http.HandlerFunc {
 			Question:  req.Q,
 			Mode:      req.Mode,
 			TopK:      req.TopK,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// askGlobalHandler runs GraphRAG global map-reduce (viewer+, §7). Namespace =
+// "kb_"+id (same convention as askHandler); namespace-only isolation (§8).
+func askGlobalHandler(asker Asker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Q              string `json:"q"`
+			MaxCommunities int    `json:"maxCommunities"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		out, err := asker.AskGlobal(r.Context(), retrieval.GlobalInput{
+			Namespace:      "kb_" + r.PathValue("id"),
+			Question:       req.Q,
+			MaxCommunities: req.MaxCommunities,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// askDriftHandler runs GraphRAG drift search (viewer+, §7). Namespace-only (§8).
+func askDriftHandler(asker Asker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Q              string `json:"q"`
+			MaxCommunities int    `json:"maxCommunities"`
+			Rounds         int    `json:"rounds"`
+			TopK           int    `json:"topK"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		out, err := asker.AskDrift(r.Context(), retrieval.DriftInput{
+			Namespace:      "kb_" + r.PathValue("id"),
+			Question:       req.Q,
+			MaxCommunities: req.MaxCommunities,
+			Rounds:         req.Rounds,
+			TopK:           req.TopK,
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)

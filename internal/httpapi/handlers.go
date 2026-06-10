@@ -199,6 +199,86 @@ func deleteDocHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 	}
 }
 
+// getDocHandler returns a single document's status snapshot (viewer+, §16.2):
+// {id, status, phase, chunkCount, error}. Uses the same DocStatusReader as the
+// SSE progress endpoint, keyed by kb.ID + docId.
+func getDocHandler(repo kbGetter, reader DocStatusReader) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kb, err := repo.Get(r.Context(), r.PathValue("id"))
+		if errors.Is(err, orgkb.ErrNotFound) {
+			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		docID := r.PathValue("docId")
+		status, phase, cc, errMsg, err := reader.DocumentStatus(r.Context(), kb.ID, docID)
+		if err != nil {
+			http.Error(w, "document not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": docID, "status": status, "phase": phase, "chunkCount": cc, "error": errMsg,
+		})
+	}
+}
+
+// listCommunitiesHandler lists the GraphRAG communities for a kb (viewer+, M3).
+// The CommunityReader returns kb-local DTOs (CommunityView) — httpapi serializes
+// them to lowercase JSON without importing rag/graph (spec §4).
+func listCommunitiesHandler(repo kbGetter, cr CommunityReader) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kb, err := repo.Get(r.Context(), r.PathValue("id"))
+		if errors.Is(err, orgkb.ErrNotFound) {
+			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		comms, err := cr.ListCommunities(r.Context(), kb.Namespace)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		items := make([]map[string]any, 0, len(comms))
+		for _, c := range comms {
+			items = append(items, map[string]any{
+				"id": c.ID, "level": c.Level, "parentId": c.ParentID, "entityCount": c.EntityCount,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	}
+}
+
+// communityReportHandler returns a single community's report (viewer+, M3).
+// A missing report (ok==false) is a 404 — distinct from an internal error.
+func communityReportHandler(repo kbGetter, cr CommunityReader) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kb, err := repo.Get(r.Context(), r.PathValue("id"))
+		if errors.Is(err, orgkb.ErrNotFound) {
+			http.Error(w, "kb not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		rep, ok, err := cr.CommunityReport(r.Context(), kb.Namespace, r.PathValue("cid"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "community report not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": rep.ID, "title": rep.Title, "summary": rep.Summary,
+		})
+	}
+}
+
 func getKBHandler(repo *orgkb.Repo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		kb, err := repo.Get(r.Context(), r.PathValue("id"))
