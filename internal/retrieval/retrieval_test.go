@@ -28,6 +28,9 @@ func (f *fakeRag) Import(context.Context, []ragingest.Document, ragingest.Import
 func (f *fakeRag) ListChunkIDs(context.Context, string, string) ([]string, error) { return nil, nil }
 func (f *fakeRag) RemoveGraphBySource(context.Context, string, []string) error    { return nil }
 func (f *fakeRag) RemoveChunks(context.Context, string, string) (int, error)      { return 0, nil }
+func (f *fakeRag) Retrieve(ctx context.Context, query string, opts ragcore.SearchOptions) ([]ragstore.Hit, error) {
+	return nil, nil
+}
 
 // M3 RagPort surface — global/drift return canned answers for the mapping tests.
 func (f *fakeRag) AskGlobal(_ context.Context, _ string, _ ragsvc.GlobalRequest) (ragcore.Answer, error) {

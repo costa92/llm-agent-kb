@@ -6,6 +6,7 @@ import (
 
 	"github.com/costa92/llm-agent-contract/llm"
 	"github.com/costa92/llm-agent-otel/otelrag"
+	raggenerate "github.com/costa92/llm-agent-rag/generate"
 	raggraph "github.com/costa92/llm-agent-rag/graph"
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
 	ragpostgres "github.com/costa92/llm-agent-rag/postgres"
@@ -48,6 +49,9 @@ type DriftRequest struct {
 // M1: Ask + Import + the three delete primitives (§16.4).
 type RagPort interface {
 	Ask(ctx context.Context, question string, req AskRequest) (ragcore.Answer, error)
+	// Retrieve runs retrieval only (no generation) — backs the kb eval
+	// RetrievalEvaluator (§9). Delegated to the otelrag Wrapper (auto-span).
+	Retrieve(ctx context.Context, query string, opts ragcore.SearchOptions) ([]ragstore.Hit, error)
 	Import(ctx context.Context, docs []ragingest.Document, opts ragingest.ImportOptions) (ragingest.ImportResult, error)
 	// ListChunkIDs returns the chunk IDs for a source in a namespace
 	// (collected BEFORE removal so the graph can be reconciled by ID).
@@ -114,6 +118,7 @@ type Service struct {
 	chunkStore *ragpostgres.Store
 	tracer     trace.Tracer
 	detector   raggraph.CommunityDetector // for §16.4 post-delete recompute; nil → recompute is a no-op
+	model      llm.ChatModel              // kept for the eval LLM-as-judge seam (JudgeModel)
 }
 
 // New wires the adapters, rag.System, and the otelrag wrapper.
@@ -141,7 +146,7 @@ func New(d Deps) *Service {
 	} else {
 		tracer = noop.NewTracerProvider().Tracer("ragsvc")
 	}
-	return &Service{wrapper: wrapper, chunkStore: d.ChunkStore, tracer: tracer, detector: d.CommunityDetector}
+	return &Service{wrapper: wrapper, chunkStore: d.ChunkStore, tracer: tracer, detector: d.CommunityDetector, model: d.Model}
 }
 
 func (s *Service) Ask(ctx context.Context, question string, req AskRequest) (ragcore.Answer, error) {
@@ -163,6 +168,18 @@ func (s *Service) Ask(ctx context.Context, question string, req AskRequest) (rag
 
 func (s *Service) Import(ctx context.Context, docs []ragingest.Document, opts ragingest.ImportOptions) (ragingest.ImportResult, error) {
 	return s.wrapper.Import(ctx, docs, opts)
+}
+
+// Retrieve runs retrieval only via the otelrag Wrapper (auto-instrumented).
+func (s *Service) Retrieve(ctx context.Context, query string, opts ragcore.SearchOptions) ([]ragstore.Hit, error) {
+	return s.wrapper.Retrieve(ctx, query, opts)
+}
+
+// JudgeModel returns the rag generate.Model seam (the chat model wrapped by
+// ragModelAdapter) for the kb eval LLM-as-judge. Kept here so internal/eval
+// never constructs a second rag.System or its own adapter (spec §4).
+func (s *Service) JudgeModel() raggenerate.Model {
+	return ragModelAdapter{inner: s.model}
 }
 
 func (s *Service) ListChunkIDs(ctx context.Context, namespace, sourceID string) ([]string, error) {
