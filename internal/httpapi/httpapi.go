@@ -25,6 +25,7 @@ type Asker interface {
 	Ask(ctx context.Context, in retrieval.AskInput) (retrieval.AskOutput, error)
 	AskGlobal(ctx context.Context, in retrieval.GlobalInput) (retrieval.AskOutput, error)
 	AskDrift(ctx context.Context, in retrieval.DriftInput) (retrieval.AskOutput, error)
+	AskStream(ctx context.Context, in retrieval.AskInput, cb retrieval.StreamCallback) error
 }
 
 // CommunityReader reads the GraphRAG community views (satisfied by
@@ -148,6 +149,8 @@ func NewMux(d Deps) *http.ServeMux {
 
 	// Q&A — viewer+.
 	mux.Handle("POST /api/kb/{id}/ask", chain(authzrole.RoleViewer, askHandler(d.Asker)))
+	// Streaming Q&A (M5a) — viewer+, same chain + kb scope as the non-stream ask.
+	mux.Handle("POST /api/kb/{id}/ask/stream", chain(authzrole.RoleViewer, askStreamHandler(d.Asker)))
 	// GraphRAG Q&A (M3) — global map-reduce + drift; viewer+, namespace-only.
 	mux.Handle("POST /api/kb/{id}/ask/global", chain(authzrole.RoleViewer, askGlobalHandler(d.Asker)))
 	mux.Handle("POST /api/kb/{id}/ask/drift", chain(authzrole.RoleViewer, askDriftHandler(d.Asker)))
