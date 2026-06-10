@@ -20,6 +20,7 @@ import (
 	openaiprovider "github.com/costa92/llm-agent-providers/openai"
 
 	"github.com/costa92/llm-agent-kb/internal/config"
+	kbeval "github.com/costa92/llm-agent-kb/internal/eval"
 	"github.com/costa92/llm-agent-kb/internal/fetch"
 	"github.com/costa92/llm-agent-kb/internal/httpapi"
 	"github.com/costa92/llm-agent-kb/internal/ingest"
@@ -27,6 +28,7 @@ import (
 	"github.com/costa92/llm-agent-kb/internal/orgkb"
 	"github.com/costa92/llm-agent-kb/internal/ragsvc"
 	"github.com/costa92/llm-agent-kb/internal/retrieval"
+	"github.com/costa92/llm-agent-kb/internal/sessions"
 	"github.com/costa92/llm-agent-kb/internal/storage"
 )
 
@@ -123,6 +125,20 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 		DriftTopK:            cfg.DriftTopK,
 	})
 
+	// M4: Q&A history + eval. The session repo backs both the ask-path recorder
+	// and the read endpoints; the eval Runner composes the eval Service (over the
+	// same RagPort) + the eval_run store.
+	sessionRepo := sessions.New(st.Pool())
+	retrievalSvc.SetRecorder(sessionRepo)
+
+	evalSvc := kbeval.NewService(rag, rag.JudgeModel(), kbeval.ServiceConfig{
+		MaxAskTokens:         cfg.MaxAskTokens,
+		GlobalMaxCommunities: cfg.GlobalMaxCommunities,
+		DriftRounds:          cfg.DriftRounds,
+		DriftTopK:            cfg.DriftTopK,
+	})
+	evalRunner := kbeval.NewRunner(evalSvc, kbeval.NewStore(st.Pool()), cfg.EvalDefaultTopK)
+
 	fetcher := fetch.New(fetch.Config{
 		Timeout:             cfg.FetchTimeout,
 		MaxBytes:            cfg.FetchMaxBytes,
@@ -162,6 +178,10 @@ func build(ctx context.Context, cfg config.Config) (http.Handler, func(), error)
 		MaxUploadBytes:      cfg.MaxUploadBytes,
 		KBStorageQuotaBytes: cfg.KBStorageQuotaBytes,
 		DocStatus:           ingestSvc,
+
+		EvalRunner:            evalRunner,
+		SessionReader:         sessionRepo,
+		EvalRunsPerUserMinute: cfg.MaxEvalRunsPerUserPerMinute,
 	})
 
 	cleanup := func() {
