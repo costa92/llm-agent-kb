@@ -394,6 +394,12 @@ func TestEvalAndSessionsEndToEnd(t *testing.T) {
 			return "test-secret", true
 		case "GRAPH_ENABLED":
 			return "false", true // eval here is retrieval+drift over the local path
+		case "MAX_REQUESTS_PER_USER_PER_MINUTE":
+			// This flow makes many requests (doc-readiness polling + sessions
+			// reads + 3 eval runs + 2 list calls) within one minute; the default
+			// 30/min global guard would 429 it. The e2e proves functionality, not
+			// rate limiting, so lift the cap.
+			return "1000", true
 		}
 		return "", false
 	})
