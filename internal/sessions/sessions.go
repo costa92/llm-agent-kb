@@ -148,7 +148,7 @@ func (r *Repo) Transcript(ctx context.Context, kbID, sessionID string) ([]Messag
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, role, content, citations_json, mode, created_at::text
-		 FROM qa_message WHERE session_id = $1 ORDER BY created_at ASC, id ASC`, sessionID)
+		 FROM qa_message WHERE session_id = $1 ORDER BY seq ASC`, sessionID)
 	if err != nil {
 		return nil, err
 	}

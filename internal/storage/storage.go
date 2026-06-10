@@ -164,13 +164,17 @@ var businessMigrations = []string{
 	`CREATE TABLE IF NOT EXISTS qa_message (
 		id             TEXT PRIMARY KEY,
 		session_id     TEXT NOT NULL REFERENCES qa_session(id) ON DELETE CASCADE,
+		seq            BIGSERIAL,
 		role           TEXT NOT NULL,
 		content        TEXT NOT NULL,
 		citations_json JSONB,
 		mode           TEXT NOT NULL DEFAULT '',
 		created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`,
-	`CREATE INDEX IF NOT EXISTS qa_message_session_idx ON qa_message (session_id, created_at)`,
+	// seq (a global BIGSERIAL, non-transactional) gives a stable insertion
+	// order for Transcript: a user+assistant pair committed in one tx shares an
+	// identical created_at, so ordering by timestamp is non-deterministic.
+	`CREATE INDEX IF NOT EXISTS qa_message_session_idx ON qa_message (session_id, seq)`,
 }
 
 // Migrate applies the rag store migrations (chunks/graph/community + the

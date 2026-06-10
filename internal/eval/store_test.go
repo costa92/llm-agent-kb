@@ -2,7 +2,9 @@ package eval
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -61,13 +63,22 @@ func TestEvalRunStore_InsertListLatest(t *testing.T) {
 		t.Fatalf("next cursor = %q, want empty (page not full)", next)
 	}
 
-	// Latest drift-kind benchmark for kb1+ds is the second insert.
+	// Latest drift-kind benchmark for kb1+ds is the second insert. metrics_json
+	// is JSONB, which normalizes whitespace, so compare the decoded value (the
+	// real contract: LatestBenchmark's bytes must unmarshal back to the stored
+	// struct for the drift baseline), not the raw byte string.
 	raw, ok, err := repo.LatestBenchmark(ctx, "kb1", "ds")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || string(raw) != `{"benchmark":{"x":1}}` {
-		t.Fatalf("LatestBenchmark ok=%v raw=%s", ok, raw)
+	if !ok {
+		t.Fatalf("LatestBenchmark ok=%v", ok)
+	}
+	var got, want any
+	_ = json.Unmarshal(raw, &got)
+	_ = json.Unmarshal([]byte(`{"benchmark":{"x":1}}`), &want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LatestBenchmark decoded=%v want=%v (raw=%s)", got, want, raw)
 	}
 
 	// Isolation: a different kb sees nothing.
