@@ -7,10 +7,13 @@
 package eval
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 
 	rageval "github.com/costa92/llm-agent-rag/eval"
 	raggenerate "github.com/costa92/llm-agent-rag/generate"
@@ -305,4 +308,131 @@ func marshalBaseline(r rageval.BenchmarkResult) ([]byte, error) {
 	r.Metrics.MeanGroundedness = scrub(r.Metrics.MeanGroundedness)
 	r.Metrics.MeanAnswerRelevance = scrub(r.Metrics.MeanAnswerRelevance)
 	return json.Marshal(r)
+}
+
+// runStore is the eval_run persistence surface the Runner needs (satisfied by
+// *Store). Narrowed for unit-testability; ListByKB is included so ListRuns is a
+// compile-time guarantee (no runtime type assertion).
+type runStore interface {
+	Insert(ctx context.Context, in InsertInput) (string, error)
+	LatestBenchmark(ctx context.Context, kbID, datasetName string) ([]byte, bool, error)
+	ListByKB(ctx context.Context, kbID string, limit int, cursor string) ([]RunRow, string, error)
+}
+
+// Runner is the httpapi.EvalRunner implementation: parse JSONL → run → persist.
+type Runner struct {
+	svc         *Service
+	store       runStore
+	defaultTopK int
+}
+
+// NewRunner composes the eval Service + eval_run store. defaultTopK is the
+// fallback Dataset.TopK when the inline JSONL omits top_k.
+func NewRunner(svc *Service, store runStore, defaultTopK int) *Runner {
+	if defaultTopK <= 0 {
+		defaultTopK = 5
+	}
+	return &Runner{svc: svc, store: store, defaultTopK: defaultTopK}
+}
+
+// LoadDataset parses inline JSONL bytes into an eval.Dataset (one Example per
+// line; lines beginning with // or # and blank lines skipped). TopK comes from
+// the first line that carries top_k, else defaultTopK. Mirrors eval.LoadJSONL
+// but reads from memory (the upload is inline, not a file path).
+func (rn *Runner) LoadDataset(name string, jsonl []byte) (rageval.Dataset, error) {
+	ds := rageval.Dataset{Name: name, TopK: rn.defaultTopK}
+	type wire struct {
+		rageval.Example
+		TopK int `json:"top_k,omitempty"`
+	}
+	sc := bufio.NewScanner(bytes.NewReader(jsonl))
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	topKSet := false
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		raw := strings.TrimSpace(sc.Text())
+		if raw == "" || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "#") {
+			continue
+		}
+		var w wire
+		if err := json.Unmarshal([]byte(raw), &w); err != nil {
+			return rageval.Dataset{}, fmt.Errorf("eval: dataset line %d: %w", lineNo, err)
+		}
+		if w.TopK > 0 && !topKSet {
+			ds.TopK = w.TopK
+			topKSet = true
+		}
+		ds.Examples = append(ds.Examples, w.Example)
+	}
+	if err := sc.Err(); err != nil {
+		return rageval.Dataset{}, fmt.Errorf("eval: scan dataset: %w", err)
+	}
+	if len(ds.Examples) == 0 {
+		return rageval.Dataset{}, fmt.Errorf("eval: dataset is empty")
+	}
+	return ds, nil
+}
+
+// RunEval parses the dataset, runs the kind, persists the eval_run row, and
+// returns the kb-local result + run id. Satisfies httpapi.EvalRunner.
+func (rn *Runner) RunEval(ctx context.Context, kbID, namespace string, kind Kind, datasetJSONL []byte) (EvalResult, string, error) {
+	ds, err := rn.LoadDataset("inline", datasetJSONL)
+	if err != nil {
+		return EvalResult{}, "", err
+	}
+	if kind == KindDrift {
+		prev, _, err := rn.store.LatestBenchmark(ctx, kbID, ds.Name)
+		if err != nil {
+			return EvalResult{}, "", fmt.Errorf("eval: load baseline: %w", err)
+		}
+		res, baseline, err := rn.svc.RunDrift(ctx, RunRequest{
+			KBID: kbID, Namespace: namespace, Kind: kind, Dataset: ds, PrevBenchmarkJSON: prev,
+		})
+		if err != nil {
+			return EvalResult{}, "", err
+		}
+		driftJSON, err := json.Marshal(res.Drift)
+		if err != nil {
+			return EvalResult{}, "", fmt.Errorf("eval: marshal drift: %w", err)
+		}
+		// metrics_json for drift = the scrubbed BenchmarkResult (next baseline).
+		id, err := rn.store.Insert(ctx, InsertInput{
+			KBID: kbID, Kind: kind, DatasetName: ds.Name,
+			MetricsJSON: baseline, DriftJSON: driftJSON,
+		})
+		if err != nil {
+			return EvalResult{}, "", err
+		}
+		return res, id, nil
+	}
+
+	res, err := rn.svc.Run(ctx, RunRequest{KBID: kbID, Namespace: namespace, Kind: kind, Dataset: ds})
+	if err != nil {
+		return EvalResult{}, "", err
+	}
+	var metricsJSON []byte
+	switch {
+	case res.Retrieval != nil:
+		metricsJSON, err = json.Marshal(res.Retrieval)
+	case res.Generation != nil:
+		metricsJSON, err = json.Marshal(res.Generation)
+	default:
+		metricsJSON = []byte(`{}`)
+	}
+	if err != nil {
+		return EvalResult{}, "", fmt.Errorf("eval: marshal metrics: %w", err)
+	}
+	id, err := rn.store.Insert(ctx, InsertInput{
+		KBID: kbID, Kind: kind, DatasetName: ds.Name, MetricsJSON: metricsJSON,
+	})
+	if err != nil {
+		return EvalResult{}, "", err
+	}
+	return res, id, nil
+}
+
+// ListRuns lists eval runs for a kb (satisfies httpapi.EvalRunner).
+func (rn *Runner) ListRuns(ctx context.Context, kbID string, limit int, cursor string) ([]RunRow, string, error) {
+	return rn.store.ListByKB(ctx, kbID, limit, cursor)
 }

@@ -180,6 +180,83 @@ func TestMarshalBaselineScrubsNaN(t *testing.T) {
 	}
 }
 
+// fakeStore captures Insert + serves a baseline.
+type fakeStore struct {
+	inserted   InsertInput
+	insertedID string
+	baseline   []byte
+}
+
+func (f *fakeStore) Insert(ctx context.Context, in InsertInput) (string, error) {
+	f.inserted = in
+	f.insertedID = "run-1"
+	return f.insertedID, nil
+}
+func (f *fakeStore) LatestBenchmark(ctx context.Context, kbID, ds string) ([]byte, bool, error) {
+	if f.baseline == nil {
+		return nil, false, nil
+	}
+	return f.baseline, true, nil
+}
+func (f *fakeStore) ListByKB(ctx context.Context, kbID string, limit int, cursor string) ([]RunRow, string, error) {
+	return nil, "", nil
+}
+
+func TestRunnerRunEvalRetrieval(t *testing.T) {
+	port := fakePort{hits: []ragstore.Hit{{}}}
+	svc := NewService(port, stubJudgeModel{}, ServiceConfig{})
+	store := &fakeStore{}
+	runner := NewRunner(svc, store, 5)
+	jsonl := `{"query":"q1","gold_doc_ids":["d1"],"top_k":5}`
+	res, id, err := runner.RunEval(context.Background(), "kb1", "kb_kb1", KindRetrieval, []byte(jsonl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "run-1" {
+		t.Fatalf("id = %q", id)
+	}
+	if res.Retrieval == nil {
+		t.Fatalf("no retrieval metrics: %+v", res)
+	}
+	if store.inserted.Kind != KindRetrieval || store.inserted.KBID != "kb1" {
+		t.Fatalf("inserted = %+v", store.inserted)
+	}
+	if store.inserted.DriftJSON != nil {
+		t.Fatalf("retrieval run must not set drift_json")
+	}
+}
+
+func TestRunnerRunEvalDriftPersistsBaseline(t *testing.T) {
+	port := fakePort{answer: ragcore.Answer{Text: "a"}}
+	svc := NewService(port, stubJudgeModel{}, ServiceConfig{})
+	store := &fakeStore{}
+	runner := NewRunner(svc, store, 5)
+	jsonl := `{"query":"q1","top_k":5}`
+	res, _, err := runner.RunEval(context.Background(), "kb1", "kb_kb1", KindDrift, []byte(jsonl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Drift == nil {
+		t.Fatalf("no drift view: %+v", res)
+	}
+	// metrics_json for drift carries the scrubbed benchmark (must re-decode).
+	var bench rageval.BenchmarkResult
+	if err := json.Unmarshal(store.inserted.MetricsJSON, &bench); err != nil {
+		t.Fatalf("drift metrics_json must be a decodable BenchmarkResult: %v (raw=%s)", err, store.inserted.MetricsJSON)
+	}
+	if store.inserted.DriftJSON == nil {
+		t.Fatalf("drift run must set drift_json")
+	}
+}
+
+func TestRunnerRejectsEmptyDataset(t *testing.T) {
+	runner := NewRunner(NewService(fakePort{}, stubJudgeModel{}, ServiceConfig{}), &fakeStore{}, 5)
+	_, _, err := runner.RunEval(context.Background(), "kb1", "kb_kb1", KindRetrieval, []byte("\n\n"))
+	if err == nil {
+		t.Fatal("empty dataset must error")
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
