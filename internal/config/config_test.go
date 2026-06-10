@@ -135,3 +135,37 @@ func TestLoadGraphOverrides(t *testing.T) {
 		t.Errorf("GlobalMaxCommunities = %d, want 16", cfg.GlobalMaxCommunities)
 	}
 }
+
+func TestLoadDefaults_M4EvalKnobs(t *testing.T) {
+	cfg, err := LoadFromLookup(func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxEvalRunsPerUserPerMinute != 5 {
+		t.Errorf("MaxEvalRunsPerUserPerMinute = %d, want 5", cfg.MaxEvalRunsPerUserPerMinute)
+	}
+	if cfg.EvalDefaultTopK != 5 {
+		t.Errorf("EvalDefaultTopK = %d, want 5", cfg.EvalDefaultTopK)
+	}
+}
+
+func TestLoad_M4EvalKnobsOverride(t *testing.T) {
+	cfg, err := LoadFromLookup(func(k string) (string, bool) {
+		switch k {
+		case "MAX_EVAL_RUNS_PER_USER_PER_MINUTE":
+			return "2", true
+		case "EVAL_DEFAULT_TOP_K":
+			return "8", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxEvalRunsPerUserPerMinute != 2 {
+		t.Errorf("MaxEvalRunsPerUserPerMinute = %d, want 2", cfg.MaxEvalRunsPerUserPerMinute)
+	}
+	if cfg.EvalDefaultTopK != 8 {
+		t.Errorf("EvalDefaultTopK = %d, want 8", cfg.EvalDefaultTopK)
+	}
+}

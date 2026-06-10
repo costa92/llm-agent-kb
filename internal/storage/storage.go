@@ -141,6 +141,40 @@ var businessMigrations = []string{
 	// (CREATE TABLE IF NOT EXISTS skips the body when table already exists), so
 	// explicitly ALTER for M1→M2 in-place upgrades.
 	`ALTER TABLE document ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT ''`,
+	// M4 eval + sessions (§5).
+	`CREATE TABLE IF NOT EXISTS eval_run (
+		id           TEXT PRIMARY KEY,
+		kb_id        TEXT NOT NULL,
+		kind         TEXT NOT NULL,
+		dataset_name TEXT NOT NULL,
+		metrics_json JSONB NOT NULL,
+		drift_json   JSONB,
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`,
+	`CREATE INDEX IF NOT EXISTS eval_run_kb_idx ON eval_run (kb_id, id DESC)`,
+	`CREATE INDEX IF NOT EXISTS eval_run_drift_idx ON eval_run (kb_id, dataset_name, kind, id DESC)`,
+	`CREATE TABLE IF NOT EXISTS qa_session (
+		id         TEXT PRIMARY KEY,
+		kb_id      TEXT NOT NULL,
+		user_id    TEXT NOT NULL,
+		title      TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`,
+	`CREATE INDEX IF NOT EXISTS qa_session_kb_idx ON qa_session (kb_id, id DESC)`,
+	`CREATE TABLE IF NOT EXISTS qa_message (
+		id             TEXT PRIMARY KEY,
+		session_id     TEXT NOT NULL REFERENCES qa_session(id) ON DELETE CASCADE,
+		seq            BIGSERIAL,
+		role           TEXT NOT NULL,
+		content        TEXT NOT NULL,
+		citations_json JSONB,
+		mode           TEXT NOT NULL DEFAULT '',
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`,
+	// seq (a global BIGSERIAL, non-transactional) gives a stable insertion
+	// order for Transcript: a user+assistant pair committed in one tx shares an
+	// identical created_at, so ordering by timestamp is non-deterministic.
+	`CREATE INDEX IF NOT EXISTS qa_message_session_idx ON qa_message (session_id, seq)`,
 }
 
 // Migrate applies the rag store migrations (chunks/graph/community + the

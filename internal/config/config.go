@@ -37,6 +37,10 @@ type Config struct {
 	MaxAskTokens                int // per-Ask cumulative token budget (rag AskOptions.MaxTotalTokens)
 	MaxRequestsPerUserPerMinute int // per-user fixed-window cap on ask/upload
 
+	// M4 eval quota + defaults (§11, §13).
+	MaxEvalRunsPerUserPerMinute int // per-user fixed-window cap on POST /eval/run (eval is LLM/compute-heavy)
+	EvalDefaultTopK             int // default eval.Dataset.TopK when the uploaded dataset omits top_k and the request omits it
+
 	// M2 ingest worker pool.
 	IngestWorkers      int           // number of concurrent worker goroutines
 	IngestPollInterval time.Duration // queue poll interval when idle
@@ -91,6 +95,8 @@ func LoadFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		RefreshTTL:                  time.Duration(envInt(lookup, "REFRESH_TTL_HOURS", 720)) * time.Hour,
 		MaxAskTokens:                envInt(lookup, "MAX_ASK_TOKENS", 4096),
 		MaxRequestsPerUserPerMinute: envInt(lookup, "MAX_REQUESTS_PER_USER_PER_MINUTE", 30),
+		MaxEvalRunsPerUserPerMinute: envInt(lookup, "MAX_EVAL_RUNS_PER_USER_PER_MINUTE", 5),
+		EvalDefaultTopK:             envInt(lookup, "EVAL_DEFAULT_TOP_K", 5),
 		IngestWorkers:               envInt(lookup, "INGEST_WORKERS", 2),
 		IngestPollInterval:          time.Duration(envInt(lookup, "INGEST_POLL_INTERVAL_SECONDS", 2)) * time.Second,
 		IngestLease:                 time.Duration(envInt(lookup, "INGEST_LEASE_SECONDS", 60)) * time.Second,

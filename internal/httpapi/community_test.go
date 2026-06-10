@@ -24,9 +24,11 @@ type fakeAsker struct {
 	out       retrieval.AskOutput
 	globalOut retrieval.AskOutput
 	driftOut  retrieval.AskOutput
+	gotAsk    retrieval.AskInput // captured by Ask for the session-threading test
 }
 
-func (f *fakeAsker) Ask(context.Context, retrieval.AskInput) (retrieval.AskOutput, error) {
+func (f *fakeAsker) Ask(_ context.Context, in retrieval.AskInput) (retrieval.AskOutput, error) {
+	f.gotAsk = in
 	return f.out, nil
 }
 func (f *fakeAsker) AskGlobal(context.Context, retrieval.GlobalInput) (retrieval.AskOutput, error) {

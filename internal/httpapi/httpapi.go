@@ -81,6 +81,10 @@ type Deps struct {
 	MaxUploadBytes      int64           // http.MaxBytesReader cap per document body
 	KBStorageQuotaBytes int64           // per-kb cumulative content-byte quota (§16.3)
 	DocStatus           DocStatusReader // reads document status for SSE; satisfied by *ingest.Service
+
+	EvalRunner            EvalRunner    // eval run/list (M4); nil disables eval routes
+	SessionReader         SessionReader // Q&A history reads (M4); nil disables session routes
+	EvalRunsPerUserMinute int           // per-user eval-run budget (separate, smaller than the ask limiter)
 }
 
 // kbScopeFromRequest builds the ScopeFromRequest closure for kb-scoped routes
@@ -112,6 +116,7 @@ func NewMux(d Deps) *http.ServeMux {
 		d.AuthHandlers.Mount(mux, "/api/auth")
 	}
 	guard := limits.New(d.PerUserLimit)
+	evalGuard := limits.New(d.EvalRunsPerUserMinute)
 	kbScope := kbScopeFromRequest(d.OrgLookup)
 
 	// authOnly composes: Authenticate → per-user limit → handler. No scope role
@@ -163,6 +168,16 @@ func NewMux(d Deps) *http.ServeMux {
 		mux.Handle("GET /api/kb/{id}", chain(authzrole.RoleViewer, getKBHandler(d.KBRepo)))
 		mux.Handle("DELETE /api/kb/{id}", chain(authzrole.RoleAdmin, deleteKBHandler(d.KBRepo, d.Ingester)))
 	}
+	// Eval (M4) — run is editor+, list is viewer+. Wired only when an EvalRunner + KBRepo are set.
+	if d.EvalRunner != nil && d.KBRepo != nil {
+		mux.Handle("POST /api/kb/{id}/eval/run", chain(authzrole.RoleEditor, evalRunHandler(d.KBRepo, d.EvalRunner, evalGuard)))
+		mux.Handle("GET /api/kb/{id}/eval/runs", chain(authzrole.RoleViewer, listRunsHandler(d.KBRepo, d.EvalRunner)))
+	}
+	// Sessions (M4) — viewer+. Wired only when a SessionReader + KBRepo are set.
+	if d.SessionReader != nil && d.KBRepo != nil {
+		mux.Handle("GET /api/kb/{id}/sessions", chain(authzrole.RoleViewer, listSessionsHandler(d.KBRepo, d.SessionReader)))
+		mux.Handle("GET /api/kb/{id}/sessions/{sid}", chain(authzrole.RoleViewer, sessionTranscriptHandler(d.KBRepo, d.SessionReader)))
+	}
 	return mux
 }
 
@@ -187,9 +202,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func askHandler(asker Asker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Q    string `json:"q"`
-			Mode string `json:"mode"`
-			TopK int    `json:"topK"`
+			Q         string `json:"q"`
+			Mode      string `json:"mode"`
+			TopK      int    `json:"topK"`
+			SessionID string `json:"sessionId"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -197,6 +213,9 @@ func askHandler(asker Asker) http.HandlerFunc {
 		}
 		out, err := asker.Ask(r.Context(), retrieval.AskInput{
 			Namespace: "kb_" + r.PathValue("id"), // namespace = "kb_"+id (orgkb.Create convention)
+			KBID:      r.PathValue("id"),
+			UserID:    authzhttp.UserID(r.Context()),
+			SessionID: req.SessionID,
 			Question:  req.Q,
 			Mode:      req.Mode,
 			TopK:      req.TopK,
@@ -216,6 +235,7 @@ func askGlobalHandler(asker Asker) http.HandlerFunc {
 		var req struct {
 			Q              string `json:"q"`
 			MaxCommunities int    `json:"maxCommunities"`
+			SessionID      string `json:"sessionId"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -223,6 +243,9 @@ func askGlobalHandler(asker Asker) http.HandlerFunc {
 		}
 		out, err := asker.AskGlobal(r.Context(), retrieval.GlobalInput{
 			Namespace:      "kb_" + r.PathValue("id"),
+			KBID:           r.PathValue("id"),
+			UserID:         authzhttp.UserID(r.Context()),
+			SessionID:      req.SessionID,
 			Question:       req.Q,
 			MaxCommunities: req.MaxCommunities,
 		})
@@ -242,6 +265,7 @@ func askDriftHandler(asker Asker) http.HandlerFunc {
 			MaxCommunities int    `json:"maxCommunities"`
 			Rounds         int    `json:"rounds"`
 			TopK           int    `json:"topK"`
+			SessionID      string `json:"sessionId"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -249,6 +273,9 @@ func askDriftHandler(asker Asker) http.HandlerFunc {
 		}
 		out, err := asker.AskDrift(r.Context(), retrieval.DriftInput{
 			Namespace:      "kb_" + r.PathValue("id"),
+			KBID:           r.PathValue("id"),
+			UserID:         authzhttp.UserID(r.Context()),
+			SessionID:      req.SessionID,
 			Question:       req.Q,
 			MaxCommunities: req.MaxCommunities,
 			Rounds:         req.Rounds,

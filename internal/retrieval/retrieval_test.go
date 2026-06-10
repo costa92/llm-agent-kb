@@ -28,6 +28,9 @@ func (f *fakeRag) Import(context.Context, []ragingest.Document, ragingest.Import
 func (f *fakeRag) ListChunkIDs(context.Context, string, string) ([]string, error) { return nil, nil }
 func (f *fakeRag) RemoveGraphBySource(context.Context, string, []string) error    { return nil }
 func (f *fakeRag) RemoveChunks(context.Context, string, string) (int, error)      { return 0, nil }
+func (f *fakeRag) Retrieve(ctx context.Context, query string, opts ragcore.SearchOptions) ([]ragstore.Hit, error) {
+	return nil, nil
+}
 
 // M3 RagPort surface — global/drift return canned answers for the mapping tests.
 func (f *fakeRag) AskGlobal(_ context.Context, _ string, _ ragsvc.GlobalRequest) (ragcore.Answer, error) {
@@ -96,6 +99,54 @@ func TestRejectsUnknownMode(t *testing.T) {
 	svc := New(&fakeRag{}, Config{})
 	if _, err := svc.Ask(context.Background(), AskInput{Mode: "global"}); err == nil {
 		t.Fatal("global is M3 — must be rejected in M1")
+	}
+}
+
+// fakeRecorder records the persistence calls.
+type fakeRecorder struct {
+	ensured  bool
+	appended bool
+	gotMode  string
+	sid      string
+}
+
+func (f *fakeRecorder) EnsureSession(ctx context.Context, kbID, userID, sessionID, firstQuestion string) (string, error) {
+	f.ensured = true
+	f.sid = "sess1"
+	return f.sid, nil
+}
+func (f *fakeRecorder) AppendPair(ctx context.Context, sessionID, question, answer string, citationsJSON []byte, mode string) error {
+	f.appended = true
+	f.gotMode = mode
+	return nil
+}
+
+func TestAskPersistsSession(t *testing.T) {
+	rec := &fakeRecorder{}
+	fake := &fakeRag{answer: ragcore.Answer{
+		Text: "the answer",
+		Hits: []ragstore.Hit{{Chunk: ragstore.StoredChunk{ID: "c1", Content: "snippet"}, Score: 0.9}},
+		Citations: []ragcore.Citation{{
+			ChunkID: "c1", DocID: "d1", Title: "Doc One", Score: 0.9,
+		}},
+		Diagnostics: ragcore.Diagnostics{HitCount: 1},
+	}}
+	svc := New(fake, Config{})
+	svc.SetRecorder(rec)
+	out, err := svc.Ask(context.Background(), AskInput{
+		Namespace: "kb_x", KBID: "x", UserID: "u1", Question: "fox?", Mode: "hybrid", TopK: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.SessionID != "sess1" {
+		t.Fatalf("SessionID = %q, want sess1", out.SessionID)
+	}
+	if !rec.ensured || !rec.appended {
+		t.Fatalf("recorder not called: ensured=%v appended=%v", rec.ensured, rec.appended)
+	}
+	if rec.gotMode != "hybrid" {
+		t.Fatalf("mode = %q", rec.gotMode)
 	}
 }
 

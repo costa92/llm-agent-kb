@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/costa92/llm-agent-contract/llm"
+	raggenerate "github.com/costa92/llm-agent-rag/generate"
 	raggraph "github.com/costa92/llm-agent-rag/graph"
 	ragingest "github.com/costa92/llm-agent-rag/ingest"
 	ragpostgres "github.com/costa92/llm-agent-rag/postgres"
@@ -275,5 +276,25 @@ func TestNewLLMGraphComponentsHonorsResolverToggle(t *testing.T) {
 	on := NewLLMGraphComponents(model, embedder, GraphConfig{LouvainResolution: 1.5, ResolverEnabled: true, ResolverThreshold: 0.9})
 	if on.EntityResolver == nil {
 		t.Fatal("resolver enabled → EntityResolver must be set")
+	}
+}
+
+func TestServiceExposesJudgeModel(t *testing.T) {
+	svc := New(Deps{
+		Model:    llm.NewScriptedLLM(llm.WithResponses(llm.Response{Text: `{"groundedness":1,"answer_relevance":1}`})),
+		Embedder: llm.NewScriptedLLM(llm.WithEmbedDimensions(4)),
+	})
+	jm := svc.JudgeModel()
+	if jm == nil {
+		t.Fatal("JudgeModel() returned nil")
+	}
+	resp, err := jm.Generate(context.Background(), raggenerate.Request{
+		Messages: []raggenerate.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("judge model generate: %v", err)
+	}
+	if resp.Text == "" {
+		t.Fatal("judge model returned empty text")
 	}
 }

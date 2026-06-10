@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -40,5 +41,28 @@ func TestAskDriftHandler(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	if out["answer"] != "D" {
 		t.Fatalf("answer=%v", out["answer"])
+	}
+}
+
+func TestAskHandlerThreadsSessionFields(t *testing.T) {
+	asker := &fakeAsker{out: retrieval.AskOutput{Answer: "a", SessionID: "sess1"}}
+	h := askHandler(asker)
+	req := httptest.NewRequest("POST", "/api/kb/x/ask", strings.NewReader(`{"q":"fox","mode":"hybrid","topK":5,"sessionId":"s9"}`))
+	req.SetPathValue("id", "x")
+	w := httptest.NewRecorder()
+	h(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", w.Code, w.Body.String())
+	}
+	if asker.gotAsk.KBID != "x" {
+		t.Fatalf("KBID = %q, want x", asker.gotAsk.KBID)
+	}
+	if asker.gotAsk.SessionID != "s9" {
+		t.Fatalf("SessionID = %q, want s9", asker.gotAsk.SessionID)
+	}
+	// UserID comes from authzhttp.UserID(ctx) — empty outside the auth chain, which
+	// is correct: the handler must read it from context, not the body.
+	if asker.gotAsk.Namespace != "kb_x" {
+		t.Fatalf("Namespace = %q, want kb_x", asker.gotAsk.Namespace)
 	}
 }
