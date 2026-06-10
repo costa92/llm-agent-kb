@@ -48,6 +48,12 @@ func TestEndToEndLoginCreateKBUploadAskDelete(t *testing.T) {
 			return "8", true
 		case "JWT_SECRET":
 			return "test-secret", true
+		case "GRAPH_ENABLED":
+			// This e2e proves the M2 async-ingest + ask + delete path with a
+			// single scripted response; graph extraction would consume that
+			// response during ingest (cursor exhausts before ask). GraphRAG is
+			// covered by TestGraphRAGEndToEnd, which over-provisions the script.
+			return "false", true
 		}
 		return "", false
 	})
