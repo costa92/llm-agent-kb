@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
@@ -565,6 +566,205 @@ func TestEvalAndSessionsEndToEnd(t *testing.T) {
 	}
 	if !foundDrift {
 		t.Fatalf("no drift run with a drift payload: %v", runItems)
+	}
+}
+
+// TestStreamingAskEndToEnd drives POST /api/kb/{id}/ask/stream over live
+// pgvector: login → org → kb → upload paste → poll ready → open the SSE stream
+// → assert ≥1 token frame + a terminal done frame with ≥1 citation + sessionId,
+// then assert the q/a pair persisted (qa_session row exists). Providers are
+// scripted: ScriptedLLM.Stream emits one EventTextDelta then EventDone, so the
+// answer arrives as a single token frame. Gated on LLM_AGENT_KB_PG_URL.
+func TestStreamingAskEndToEnd(t *testing.T) {
+	dsn := os.Getenv("LLM_AGENT_KB_PG_URL")
+	if dsn == "" {
+		t.Skipf("set LLM_AGENT_KB_PG_URL (pgvector) to run the streaming e2e")
+	}
+	ctx := context.Background()
+	cleanDB(t, ctx, dsn)
+
+	providerOverride = func(config.Config) (llm.ChatModel, llm.Embedder, error) {
+		return llm.NewScriptedLLM(llm.WithResponses(llm.Response{Text: "scripted streamed answer"})),
+			llm.NewScriptedLLM(llm.WithEmbedDimensions(8)), nil
+	}
+	t.Cleanup(func() { providerOverride = nil })
+
+	cfg, err := config.LoadFromLookup(func(k string) (string, bool) {
+		switch k {
+		case "PG_URL":
+			return dsn, true
+		case "EMBEDDING_DIM":
+			return "8", true
+		case "JWT_SECRET":
+			return "test-secret", true
+		case "GRAPH_ENABLED":
+			return "false", true
+		case "MAX_REQUESTS_PER_USER_PER_MINUTE":
+			// The doc-readiness poll loop + stream + sessions read can exceed the
+			// default 30/min global guard within one minute; the e2e proves
+			// functionality, not rate limiting, so lift the cap (mirrors the M4
+			// eval e2e).
+			return "1000", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, cleanup, err := build(ctx, cfg)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	defer cleanup()
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	hash, err := password.Hash("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authzstore.New(pool).CreateUser(ctx, "stream@x.com", hash); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	client := srv.Client()
+	do := func(method, path, bearer, body string) (int, map[string]any) {
+		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		if m == nil {
+			m = map[string]any{"_raw": string(raw)}
+		}
+		return resp.StatusCode, m
+	}
+
+	code, body := do("POST", "/api/auth/login", "", `{"Email":"stream@x.com","Password":"pw"}`)
+	if code != http.StatusOK {
+		t.Fatalf("login code=%d body=%v want 200", code, body)
+	}
+	token, _ := body["access_token"].(string)
+	if token == "" {
+		t.Fatalf("login returned no access_token: %v", body)
+	}
+
+	code, body = do("POST", "/api/orgs", token, `{"name":"Acme"}`)
+	if code != http.StatusOK {
+		t.Fatalf("create org code=%d body=%v want 200", code, body)
+	}
+	orgID, _ := body["id"].(string)
+
+	code, body = do("POST", "/api/orgs/"+orgID+"/kbs", token, `{"name":"Docs","embeddingDim":8}`)
+	if code != http.StatusOK {
+		t.Fatalf("create kb code=%d body=%v want 200", code, body)
+	}
+	kbID, _ := body["id"].(string)
+	if kbID == "" {
+		t.Fatalf("create kb returned no id: %v", body)
+	}
+
+	code, body = do("POST", "/api/kb/"+kbID+"/documents", token,
+		`{"title":"Doc","sourceType":"paste","content":"the quick brown fox jumps over the lazy dog repeatedly"}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("upload code=%d body=%v want 202", code, body)
+	}
+	docID, _ := body["documentId"].(string)
+	if docID == "" {
+		t.Fatalf("upload returned no documentId: %v", body)
+	}
+
+	ready := false
+	for i := 0; i < 50; i++ {
+		code, listBody := do("GET", "/api/kb/"+kbID+"/documents", token, "")
+		if code == http.StatusOK && hasReadyDoc(listBody, docID) {
+			ready = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatalf("document %s never reached ready", docID)
+	}
+
+	// Open the SSE stream and parse frames.
+	streamReq, _ := http.NewRequest("POST", srv.URL+"/api/kb/"+kbID+"/ask/stream",
+		strings.NewReader(`{"q":"fox","mode":"hybrid","topK":5}`))
+	streamReq.Header.Set("Content-Type", "application/json")
+	streamReq.Header.Set("Authorization", "Bearer "+token)
+	streamResp, err := client.Do(streamReq)
+	if err != nil {
+		t.Fatalf("ask/stream: %v", err)
+	}
+	defer streamResp.Body.Close()
+	if streamResp.StatusCode != http.StatusOK {
+		t.Fatalf("ask/stream code=%d want 200", streamResp.StatusCode)
+	}
+	if ct := streamResp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("ask/stream Content-Type=%q want text/event-stream", ct)
+	}
+
+	var tokenCount int
+	var doneData map[string]any
+	var curEvent string
+	sc := bufio.NewScanner(streamResp.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			curEvent = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data := strings.TrimPrefix(line, "data: ")
+			switch curEvent {
+			case "token":
+				tokenCount++
+			case "done":
+				_ = json.Unmarshal([]byte(data), &doneData)
+			case "error":
+				t.Fatalf("stream emitted error frame: %s", data)
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan SSE: %v", err)
+	}
+	if tokenCount == 0 {
+		t.Fatal("expected at least one token frame")
+	}
+	if doneData == nil {
+		t.Fatal("expected a terminal done frame")
+	}
+	cites, _ := doneData["citations"].([]any)
+	if len(cites) == 0 {
+		t.Fatalf("done frame returned 0 citations: %v", doneData)
+	}
+	sid, _ := doneData["sessionId"].(string)
+	if sid == "" {
+		t.Fatalf("done frame missing sessionId: %v", doneData)
+	}
+
+	// Persistence: the streamed q/a pair created a session row for this kb.
+	var sessions int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM qa_session WHERE kb_id = $1`, kbID).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions == 0 {
+		t.Fatal("streamed ask did not persist a qa_session row")
 	}
 }
 

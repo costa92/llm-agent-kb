@@ -37,6 +37,9 @@ func (f *fakeAsker) AskGlobal(context.Context, retrieval.GlobalInput) (retrieval
 func (f *fakeAsker) AskDrift(context.Context, retrieval.DriftInput) (retrieval.AskOutput, error) {
 	return f.driftOut, nil
 }
+func (f *fakeAsker) AskStream(context.Context, retrieval.AskInput, retrieval.StreamCallback) error {
+	return nil
+}
 
 // fakeCommunityReader satisfies CommunityReader on kb-local DTOs (no rag/graph).
 type fakeCommunityReader struct {

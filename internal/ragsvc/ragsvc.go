@@ -52,6 +52,11 @@ type RagPort interface {
 	// Retrieve runs retrieval only (no generation) — backs the kb eval
 	// RetrievalEvaluator (§9). Delegated to the otelrag Wrapper (auto-span).
 	Retrieve(ctx context.Context, query string, opts ragcore.SearchOptions) ([]ragstore.Hit, error)
+	// StreamAnswer runs the M5a single-pass grounded streaming answer
+	// (Option A): retrieve → render rag's default QA prompt → model.Stream,
+	// delivering token deltas + a terminal done event to emit. Bypasses rag's
+	// reflection/grader orchestration by design (the non-stream Ask keeps it).
+	StreamAnswer(ctx context.Context, question string, req StreamRequest, emit func(StreamEvent) error) error
 	Import(ctx context.Context, docs []ragingest.Document, opts ragingest.ImportOptions) (ragingest.ImportResult, error)
 	// ListChunkIDs returns the chunk IDs for a source in a namespace
 	// (collected BEFORE removal so the graph can be reconciled by ID).

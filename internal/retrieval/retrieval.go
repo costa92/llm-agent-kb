@@ -247,6 +247,88 @@ func (s *Service) AskDrift(ctx context.Context, in DriftInput) (AskOutput, error
 	return out, nil
 }
 
+// StreamDone is the terminal payload delivered to StreamCallback.OnDone: the
+// citations, diagnostics, and the ensured/created session id.
+type StreamDone struct {
+	Citations   []Citation
+	Diagnostics map[string]any
+	SessionID   string
+}
+
+// StreamCallback receives streaming-ask events. OnToken fires once per answer
+// delta (concatenation yields the full answer); OnDone fires once at the end
+// with citations + diagnostics + sessionId. Returning a non-nil error from
+// either aborts the stream (the handler uses this for client disconnect).
+type StreamCallback struct {
+	OnToken func(text string) error
+	OnDone  func(StreamDone) error
+}
+
+// AskStream runs the M5a single-pass streaming ask: it forwards token deltas
+// to cb.OnToken, accumulates the answer, then on completion derives citations,
+// persists the q/a pair (reusing the M4 Recorder), and delivers cb.OnDone.
+// Modes other than vector/hybrid are rejected (global/drift are not streamed
+// in M5a). The accumulated answer is persisted AFTER the stream completes.
+func (s *Service) AskStream(ctx context.Context, in AskInput, cb StreamCallback) error {
+	var hybrid bool
+	switch in.Mode {
+	case "hybrid":
+		hybrid = true
+	case "vector":
+		hybrid = false
+	default:
+		return fmt.Errorf("retrieval: unsupported mode %q (stream supports vector|hybrid)", in.Mode)
+	}
+	topK := in.TopK
+	if topK <= 0 {
+		topK = 5
+	}
+	var answer string
+	var out StreamDone
+	err := s.rag.StreamAnswer(ctx, in.Question, ragsvc.StreamRequest{
+		Namespace: in.Namespace,
+		TopK:      topK,
+		Hybrid:    hybrid,
+	}, func(ev ragsvc.StreamEvent) error {
+		switch ev.Kind {
+		case ragsvc.StreamEventToken:
+			answer += ev.Text
+			return cb.OnToken(ev.Text)
+		case ragsvc.StreamEventDone:
+			cites := make([]Citation, 0, len(ev.Citations))
+			for _, c := range ev.Citations {
+				cites = append(cites, Citation{
+					ChunkID:     c.ChunkID,
+					DocID:       c.DocID,
+					Title:       c.Title,
+					SectionPath: c.SectionPath,
+					Score:       c.Score,
+					Snippet:     truncate(c.Snippet, s.cfg.SnippetChars),
+				})
+			}
+			out = StreamDone{
+				Citations: cites,
+				Diagnostics: map[string]any{
+					"mode":     in.Mode,
+					"hitCount": ev.HitCount,
+				},
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Persist the accumulated answer as a qa_message pair (reuse M4 seam).
+	persisted := AskOutput{Answer: answer, Citations: out.Citations}
+	sid, perr := s.persist(ctx, in.KBID, in.UserID, in.SessionID, in.Question, in.Mode, persisted)
+	if perr != nil {
+		return perr
+	}
+	out.SessionID = sid
+	return cb.OnDone(out)
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

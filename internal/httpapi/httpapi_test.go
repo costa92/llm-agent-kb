@@ -147,6 +147,9 @@ func (f fakeAsk) AskGlobal(context.Context, retrieval.GlobalInput) (retrieval.As
 func (f fakeAsk) AskDrift(context.Context, retrieval.DriftInput) (retrieval.AskOutput, error) {
 	return f.out, nil
 }
+func (f fakeAsk) AskStream(context.Context, retrieval.AskInput, retrieval.StreamCallback) error {
+	return nil
+}
 
 func bearer(t *testing.T, iss *authztoken.Issuer, uid string) string {
 	t.Helper()

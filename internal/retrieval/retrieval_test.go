@@ -12,10 +12,11 @@ import (
 )
 
 type fakeRag struct {
-	gotReq    ragsvc.AskRequest
-	answer    ragcore.Answer
-	globalAns ragcore.Answer
-	driftAns  ragcore.Answer
+	gotReq       ragsvc.AskRequest
+	gotStreamReq ragsvc.StreamRequest
+	answer       ragcore.Answer
+	globalAns    ragcore.Answer
+	driftAns     ragcore.Answer
 }
 
 func (f *fakeRag) Ask(_ context.Context, _ string, req ragsvc.AskRequest) (ragcore.Answer, error) {
@@ -30,6 +31,20 @@ func (f *fakeRag) RemoveGraphBySource(context.Context, string, []string) error  
 func (f *fakeRag) RemoveChunks(context.Context, string, string) (int, error)      { return 0, nil }
 func (f *fakeRag) Retrieve(ctx context.Context, query string, opts ragcore.SearchOptions) ([]ragstore.Hit, error) {
 	return nil, nil
+}
+func (f *fakeRag) StreamAnswer(_ context.Context, _ string, req ragsvc.StreamRequest, emit func(ragsvc.StreamEvent) error) error {
+	f.gotStreamReq = req
+	if err := emit(ragsvc.StreamEvent{Kind: ragsvc.StreamEventToken, Text: "hello "}); err != nil {
+		return err
+	}
+	if err := emit(ragsvc.StreamEvent{Kind: ragsvc.StreamEventToken, Text: "world"}); err != nil {
+		return err
+	}
+	return emit(ragsvc.StreamEvent{
+		Kind:      ragsvc.StreamEventDone,
+		HitCount:  1,
+		Citations: []ragsvc.StreamCitation{{ChunkID: "c1", DocID: "d1", Title: "Doc One", SectionPath: []string{"Intro"}, Score: 0.9, Snippet: "a long snippet of source content"}},
+	})
 }
 
 // M3 RagPort surface — global/drift return canned answers for the mapping tests.
@@ -195,5 +210,86 @@ func TestAskDriftMapsDiagnostics(t *testing.T) {
 	}
 	if out.Diagnostics["rounds"] != 2 {
 		t.Fatalf("diagnostics.rounds=%v want 2", out.Diagnostics["rounds"])
+	}
+}
+
+type recordingRecorder struct {
+	ensuredSession string
+	appendedAnswer string
+	appendedCites  []byte
+	appendedMode   string
+}
+
+func (r *recordingRecorder) EnsureSession(_ context.Context, _, _, sessionID, _ string) (string, error) {
+	if sessionID != "" {
+		r.ensuredSession = sessionID
+		return sessionID, nil
+	}
+	r.ensuredSession = "new-sid"
+	return "new-sid", nil
+}
+func (r *recordingRecorder) AppendPair(_ context.Context, _, _, answer string, citationsJSON []byte, mode string) error {
+	r.appendedAnswer = answer
+	r.appendedCites = citationsJSON
+	r.appendedMode = mode
+	return nil
+}
+
+func TestAskStreamForwardsTokensPersistsAndEmitsDone(t *testing.T) {
+	f := &fakeRag{}
+	svc := New(f, Config{MaxAskTokens: 4096, SnippetChars: 10})
+	rec := &recordingRecorder{}
+	svc.SetRecorder(rec)
+
+	var tokens []string
+	var done StreamDone
+	var doneSeen bool
+	err := svc.AskStream(context.Background(),
+		AskInput{Namespace: "ns1", KBID: "kb1", UserID: "u1", Question: "q", Mode: "hybrid", TopK: 5},
+		StreamCallback{
+			OnToken: func(text string) error { tokens = append(tokens, text); return nil },
+			OnDone:  func(d StreamDone) error { doneSeen = true; done = d; return nil },
+		})
+	if err != nil {
+		t.Fatalf("AskStream: %v", err)
+	}
+	if !f.gotStreamReq.Hybrid || f.gotStreamReq.TopK != 5 || f.gotStreamReq.Namespace != "ns1" {
+		t.Fatalf("stream req not mapped: %+v", f.gotStreamReq)
+	}
+	if len(tokens) != 2 || tokens[0] != "hello " || tokens[1] != "world" {
+		t.Fatalf("tokens = %v, want [hello  world]", tokens)
+	}
+	if !doneSeen {
+		t.Fatal("expected OnDone")
+	}
+	if len(done.Citations) != 1 || done.Citations[0].ChunkID != "c1" {
+		t.Fatalf("done citations = %+v", done.Citations)
+	}
+	if done.Citations[0].Snippet != "a long sni" { // truncated to SnippetChars=10
+		t.Fatalf("snippet not truncated to 10: %q", done.Citations[0].Snippet)
+	}
+	if done.Diagnostics["mode"] != "hybrid" || done.Diagnostics["hitCount"] != 1 {
+		t.Fatalf("done diagnostics = %v", done.Diagnostics)
+	}
+	if done.SessionID != "new-sid" {
+		t.Fatalf("done sessionId = %q, want new-sid", done.SessionID)
+	}
+	// Persistence: accumulated answer + mode recorded.
+	if rec.appendedAnswer != "hello world" {
+		t.Fatalf("persisted answer = %q, want %q", rec.appendedAnswer, "hello world")
+	}
+	if rec.appendedMode != "hybrid" {
+		t.Fatalf("persisted mode = %q, want hybrid", rec.appendedMode)
+	}
+}
+
+func TestAskStreamRejectsBadMode(t *testing.T) {
+	svc := New(&fakeRag{}, Config{})
+	err := svc.AskStream(context.Background(), AskInput{Mode: "global"}, StreamCallback{
+		OnToken: func(string) error { return nil },
+		OnDone:  func(StreamDone) error { return nil },
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported mode global")
 	}
 }

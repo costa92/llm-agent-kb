@@ -12,6 +12,7 @@ import (
 
 	"github.com/costa92/llm-agent-kb/internal/ingest"
 	"github.com/costa92/llm-agent-kb/internal/orgkb"
+	"github.com/costa92/llm-agent-kb/internal/retrieval"
 )
 
 // uploadHandler enqueues a document for async ingest (spec §6: 202 +
@@ -397,5 +398,69 @@ func deleteKBHandler(repo *orgkb.Repo, ing Ingester) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// askStreamHandler streams a grounded answer as Server-Sent Events (M5a,
+// viewer+). Wire contract: zero+ `event: token` frames ({"text":...}) then a
+// terminal `event: done` ({citations,diagnostics,sessionId}) or `event: error`.
+// Reuses the progressHandler SSE pattern: Flusher + text/event-stream headers,
+// flush per frame, client disconnect via r.Context() (plumbed through AskStream
+// → StreamAnswer → model.Stream). Body/mode errors before the first frame are
+// a normal HTTP 400; failures after headers are sent become an error frame.
+func askStreamHandler(asker Asker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Q         string `json:"q"`
+			Mode      string `json:"mode"`
+			TopK      int    `json:"topK"`
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		in := retrieval.AskInput{
+			Namespace: "kb_" + r.PathValue("id"),
+			KBID:      r.PathValue("id"),
+			UserID:    authzhttp.UserID(r.Context()),
+			SessionID: req.SessionID,
+			Question:  req.Q,
+			Mode:      req.Mode,
+			TopK:      req.TopK,
+		}
+		writeFrame := func(event string, payload any) error {
+			data, _ := json.Marshal(payload)
+			if _, err := io.WriteString(w, "event: "+event+"\ndata: "+string(data)+"\n\n"); err != nil {
+				return err
+			}
+			flusher.Flush()
+			return nil
+		}
+		err := asker.AskStream(r.Context(), in, retrieval.StreamCallback{
+			OnToken: func(text string) error {
+				return writeFrame("token", map[string]any{"text": text})
+			},
+			OnDone: func(d retrieval.StreamDone) error {
+				return writeFrame("done", map[string]any{
+					"citations":   d.Citations,
+					"diagnostics": d.Diagnostics,
+					"sessionId":   d.SessionID,
+				})
+			},
+		})
+		if err != nil {
+			// Headers are already sent (text/event-stream); surface the failure
+			// as an SSE error frame rather than a (now-impossible) HTTP status.
+			_ = writeFrame("error", map[string]any{"error": err.Error()})
+		}
 	}
 }
