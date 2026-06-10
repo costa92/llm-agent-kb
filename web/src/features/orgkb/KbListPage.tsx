@@ -98,12 +98,9 @@ export function KbListPage({ initialOrgId }: { initialOrgId?: string }) {
                 <TableCell>{kb.name}</TableCell>
                 <TableCell className="font-mono text-xs">{kb.namespace}</TableCell>
                 <TableCell className="text-right">
-                  {/* The /kb/$kbId/documents route is added in a later task, so it is
-                      not yet in the generated route tree; cast the typed link props
-                      until that route exists. */}
                   <Link
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    {...({ to: "/kb/$kbId/documents", params: { kbId: kb.id } } as any)}
+                    to="/kb/$kbId/documents"
+                    params={{ kbId: kb.id }}
                     className="text-sm underline"
                   >
                     Documents

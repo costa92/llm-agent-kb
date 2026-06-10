@@ -1,73 +1,37 @@
-# React + TypeScript + Vite
+# llm-agent-kb web
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19 + TypeScript SPA for the llm-agent-kb backend (GraphRAG Q&A platform).
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Vite 8 + React 19 + TypeScript 6
+- Tailwind CSS v4 (via `@tailwindcss/vite`; theme in `src/index.css`, no `tailwind.config.js`)
+- shadcn/ui (radix-nova) primitives in `src/components/ui/`
+- TanStack Router (file-based, `tsr generate`) + TanStack Query
+- SSE via `@microsoft/fetch-event-source` (POST + Bearer) — `src/lib/sse.ts`
+- Tests: Vitest + @testing-library/react + jsdom (mocked fetch + SSE; no live backend)
 
-## React Compiler
+## Develop
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+pnpm install
+pnpm dev      # tsr generate + vite; proxies /api → http://localhost:8080
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Start the Go backend (`kbd`) on :8080 separately so the dev proxy can reach it.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Build & test
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+pnpm build    # tsr generate + tsc -b + vite build → dist/
+pnpm test     # vitest run (all unit/component tests)
+pnpm lint     # eslint
 ```
+
+## Layout
+
+`src/{app,components,features,lib,routes,test}/`. Features are self-contained dirs
+(`api.ts`, page + component `.tsx`, tests). The typed API client (`src/lib/apiClient.ts`)
+keeps the access token in memory and refreshes on 401; response types live in
+`src/lib/types.ts`. The SSE wire contract (token/done/error) matches the backend
+`POST /api/kb/{id}/ask/stream` endpoint.
