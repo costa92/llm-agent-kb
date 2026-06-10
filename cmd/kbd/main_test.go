@@ -355,6 +355,213 @@ func TestGraphRAGEndToEnd(t *testing.T) {
 	}
 }
 
+// TestEvalAndSessionsEndToEnd drives the M4 quality surface on live pgvector:
+// login → org → kb → upload paste → poll ready → ask (hybrid) → GET /sessions
+// (assert the ask created a session + persisted the pair) → GET /sessions/{sid}
+// (assert 2 messages) → POST /eval/run (retrieval, tiny inline JSONL) → GET
+// /eval/runs (assert ≥1 run) → POST /eval/run (drift) → GET /eval/runs (assert
+// the drift run stored). Engine correctness is rag's own concern; this proves
+// the HTTP + auth + persistence wiring. The scripted model is over-provisioned
+// so the judge/ask cursors never exhaust.
+func TestEvalAndSessionsEndToEnd(t *testing.T) {
+	dsn := os.Getenv("LLM_AGENT_KB_PG_URL")
+	if dsn == "" {
+		t.Skipf("set LLM_AGENT_KB_PG_URL (pgvector) to run the M4 eval/sessions e2e")
+	}
+	ctx := context.Background()
+	cleanDB(t, ctx, dsn)
+
+	// One scripted Generate cursor backs ask answers + the LLM judge JSON.
+	// Over-provision generously (ingest with GRAPH_ENABLED=false consumes none;
+	// ask + each eval example + each drift example each draw one).
+	responses := []llm.Response{}
+	for i := 0; i < 40; i++ {
+		responses = append(responses, llm.Response{Text: `{"groundedness":0.9,"answer_relevance":0.9}`})
+	}
+	model := llm.NewScriptedLLM(llm.WithResponses(responses...))
+	providerOverride = func(config.Config) (llm.ChatModel, llm.Embedder, error) {
+		return model, llm.NewScriptedLLM(llm.WithEmbedDimensions(8)), nil
+	}
+	t.Cleanup(func() { providerOverride = nil })
+
+	cfg, err := config.LoadFromLookup(func(k string) (string, bool) {
+		switch k {
+		case "PG_URL":
+			return dsn, true
+		case "EMBEDDING_DIM":
+			return "8", true
+		case "JWT_SECRET":
+			return "test-secret", true
+		case "GRAPH_ENABLED":
+			return "false", true // eval here is retrieval+drift over the local path
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, cleanup, err := build(ctx, cfg)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	defer cleanup()
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	hash, err := password.Hash("pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authzstore.New(pool).CreateUser(ctx, "m4@x.com", hash); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	client := srv.Client()
+	do := func(method, path, bearer, body string) (int, map[string]any) {
+		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		if m == nil {
+			m = map[string]any{"_raw": string(raw)}
+		}
+		return resp.StatusCode, m
+	}
+
+	code, body := do("POST", "/api/auth/login", "", `{"Email":"m4@x.com","Password":"pw"}`)
+	if code != http.StatusOK {
+		t.Fatalf("login code=%d body=%v", code, body)
+	}
+	token, _ := body["access_token"].(string)
+
+	code, body = do("POST", "/api/orgs", token, `{"name":"Acme"}`)
+	if code != http.StatusOK {
+		t.Fatalf("create org code=%d body=%v", code, body)
+	}
+	orgID, _ := body["id"].(string)
+
+	code, body = do("POST", "/api/orgs/"+orgID+"/kbs", token, `{"name":"Docs","embeddingDim":8}`)
+	if code != http.StatusOK {
+		t.Fatalf("create kb code=%d body=%v", code, body)
+	}
+	kbID, _ := body["id"].(string)
+
+	code, body = do("POST", "/api/kb/"+kbID+"/documents", token,
+		`{"title":"Doc","sourceType":"paste","content":"the quick brown fox jumps over the lazy dog repeatedly"}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("upload code=%d body=%v", code, body)
+	}
+	docID, _ := body["documentId"].(string)
+	ready := false
+	for i := 0; i < 50; i++ {
+		code, listBody := do("GET", "/api/kb/"+kbID+"/documents", token, "")
+		if code == http.StatusOK && hasReadyDoc(listBody, docID) {
+			ready = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatalf("document never ready")
+	}
+
+	// Ask (hybrid) → assert a session id comes back.
+	code, body = do("POST", "/api/kb/"+kbID+"/ask", token, `{"q":"fox","mode":"hybrid","topK":5}`)
+	if code != http.StatusOK {
+		t.Fatalf("ask code=%d body=%v", code, body)
+	}
+	sid, _ := body["sessionId"].(string)
+	if sid == "" {
+		t.Fatalf("ask returned no sessionId: %v", body)
+	}
+
+	// GET /sessions → assert the session is listed.
+	code, body = do("GET", "/api/kb/"+kbID+"/sessions", token, "")
+	if code != http.StatusOK {
+		t.Fatalf("list sessions code=%d body=%v", code, body)
+	}
+	sessItems, _ := body["items"].([]any)
+	if len(sessItems) == 0 {
+		t.Fatalf("no sessions persisted: %v", body)
+	}
+
+	// GET /sessions/{sid} → assert 2 messages (user + assistant).
+	code, body = do("GET", "/api/kb/"+kbID+"/sessions/"+sid, token, "")
+	if code != http.StatusOK {
+		t.Fatalf("transcript code=%d body=%v", code, body)
+	}
+	msgs, _ := body["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("transcript msgs = %d, want 2: %v", len(msgs), body)
+	}
+
+	// POST /eval/run (retrieval) → 200 + runId. Tiny inline JSONL dataset.
+	evalBody := `{"kind":"retrieval","dataset":"{\"query\":\"fox\",\"gold_doc_ids\":[\"` + docID + `\"],\"top_k\":5}"}`
+	code, body = do("POST", "/api/kb/"+kbID+"/eval/run", token, evalBody)
+	if code != http.StatusOK {
+		t.Fatalf("eval/run retrieval code=%d body=%v", code, body)
+	}
+	if body["runId"] == nil || body["runId"] == "" {
+		t.Fatalf("eval/run returned no runId: %v", body)
+	}
+
+	// GET /eval/runs → assert ≥1 stored run.
+	code, body = do("GET", "/api/kb/"+kbID+"/eval/runs", token, "")
+	if code != http.StatusOK {
+		t.Fatalf("eval/runs code=%d body=%v", code, body)
+	}
+	runItems, _ := body["items"].([]any)
+	if len(runItems) == 0 {
+		t.Fatalf("no eval runs stored: %v", body)
+	}
+
+	// POST /eval/run (drift) twice so the second has a baseline; assert both 200.
+	driftBody := `{"kind":"drift","dataset":"{\"query\":\"fox\",\"top_k\":5}"}`
+	if code, body = do("POST", "/api/kb/"+kbID+"/eval/run", token, driftBody); code != http.StatusOK {
+		t.Fatalf("eval/run drift#1 code=%d body=%v", code, body)
+	}
+	if code, body = do("POST", "/api/kb/"+kbID+"/eval/run", token, driftBody); code != http.StatusOK {
+		t.Fatalf("eval/run drift#2 code=%d body=%v", code, body)
+	}
+
+	// GET /eval/runs → assert the drift run(s) are stored (≥3 total now).
+	code, body = do("GET", "/api/kb/"+kbID+"/eval/runs?limit=100", token, "")
+	if code != http.StatusOK {
+		t.Fatalf("eval/runs#2 code=%d body=%v", code, body)
+	}
+	runItems, _ = body["items"].([]any)
+	if len(runItems) < 3 {
+		t.Fatalf("eval runs = %d, want ≥3 (1 retrieval + 2 drift): %v", len(runItems), body)
+	}
+	// Assert a drift run carries the drift envelope.
+	foundDrift := false
+	for _, it := range runItems {
+		m, _ := it.(map[string]any)
+		if m["kind"] == "drift" && m["drift"] != nil {
+			foundDrift = true
+		}
+	}
+	if !foundDrift {
+		t.Fatalf("no drift run with a drift payload: %v", runItems)
+	}
+}
+
 // hasReadyDoc reports whether the document list envelope contains docID at status "ready".
 func hasReadyDoc(listBody map[string]any, docID string) bool {
 	items, _ := listBody["items"].([]any)
@@ -377,6 +584,7 @@ func cleanDB(t *testing.T, ctx context.Context, dsn string) {
 	defer pool.Close()
 	for _, tbl := range []string{
 		"ingest_job",
+		"qa_message", "qa_session", "eval_run",
 		"document", "knowledge_base",
 		"chunks", "chunks_entities", "chunks_relations", "chunks_communities", "chunks_community_reports",
 		"auth_membership", "auth_session", "auth_user", "auth_org",
