@@ -4,6 +4,7 @@ package retrieval
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/costa92/llm-agent-kb/internal/ragsvc"
@@ -22,6 +23,9 @@ type Config struct {
 // AskInput is the kb-side ask input.
 type AskInput struct {
 	Namespace string
+	KBID      string
+	UserID    string
+	SessionID string // optional; empty = create-on-first-ask
 	Question  string
 	Mode      string // "vector" | "hybrid" (M1 only)
 	TopK      int
@@ -42,12 +46,14 @@ type AskOutput struct {
 	Answer      string         `json:"answer"`
 	Citations   []Citation     `json:"citations"`
 	Diagnostics map[string]any `json:"diagnostics"`
+	SessionID   string         `json:"sessionId,omitempty"`
 }
 
 // Service maps ask requests/responses.
 type Service struct {
-	rag ragsvc.RagPort
-	cfg Config
+	rag      ragsvc.RagPort
+	cfg      Config
+	recorder Recorder
 }
 
 // New builds a retrieval Service.
@@ -56,6 +62,35 @@ func New(rag ragsvc.RagPort, cfg Config) *Service {
 		cfg.SnippetChars = 240
 	}
 	return &Service{rag: rag, cfg: cfg}
+}
+
+// Recorder persists Q&A history (satisfied by *sessions.Repo). nil disables
+// persistence (focused unit tests). Kept a narrow interface so retrieval has no
+// DB dependency.
+type Recorder interface {
+	EnsureSession(ctx context.Context, kbID, userID, sessionID, firstQuestion string) (string, error)
+	AppendPair(ctx context.Context, sessionID, question, answer string, citationsJSON []byte, mode string) error
+}
+
+// SetRecorder wires history persistence after construction (cmd/kbd sets it).
+func (s *Service) SetRecorder(r Recorder) { s.recorder = r }
+
+// persist records the q/a pair into a session (create-on-first-ask). Best effort
+// for the session id but errors propagate so callers see a 500 on a broken DB;
+// a nil recorder is a no-op (returns the inbound sessionID unchanged).
+func (s *Service) persist(ctx context.Context, kbID, userID, sessionID, question, mode string, out AskOutput) (string, error) {
+	if s.recorder == nil {
+		return sessionID, nil
+	}
+	sid, err := s.recorder.EnsureSession(ctx, kbID, userID, sessionID, question)
+	if err != nil {
+		return "", err
+	}
+	citesJSON, _ := json.Marshal(out.Citations)
+	if err := s.recorder.AppendPair(ctx, sid, question, out.Answer, citesJSON, mode); err != nil {
+		return "", err
+	}
+	return sid, nil
 }
 
 // Ask runs the vector/hybrid ask and maps citations. Modes other than
@@ -99,20 +134,29 @@ func (s *Service) Ask(ctx context.Context, in AskInput) (AskOutput, error) {
 			Snippet:     truncate(snippetByChunk[c.ChunkID], s.cfg.SnippetChars),
 		})
 	}
-	return AskOutput{
+	out := AskOutput{
 		Answer:    ans.Text,
 		Citations: cites,
 		Diagnostics: map[string]any{
 			"mode":     in.Mode,
 			"hitCount": ans.Diagnostics.HitCount,
 		},
-	}, nil
+	}
+	sid, err := s.persist(ctx, in.KBID, in.UserID, in.SessionID, in.Question, in.Mode, out)
+	if err != nil {
+		return AskOutput{}, err
+	}
+	out.SessionID = sid
+	return out, nil
 }
 
 // GlobalInput is the kb-side AskGlobal input (spec §7). Isolation is
 // Namespace-ONLY (§8) — no SecurityFilters on the global path.
 type GlobalInput struct {
 	Namespace      string
+	KBID           string
+	UserID         string
+	SessionID      string
 	Question       string
 	MaxCommunities int
 }
@@ -120,6 +164,9 @@ type GlobalInput struct {
 // DriftInput is the kb-side AskDrift input (spec §7). Namespace-only (§8).
 type DriftInput struct {
 	Namespace      string
+	KBID           string
+	UserID         string
+	SessionID      string
 	Question       string
 	MaxCommunities int
 	Rounds         int
@@ -141,7 +188,7 @@ func (s *Service) AskGlobal(ctx context.Context, in GlobalInput) (AskOutput, err
 	if err != nil {
 		return AskOutput{}, err
 	}
-	return AskOutput{
+	out := AskOutput{
 		Answer:    ans.Text,
 		Citations: []Citation{},
 		Diagnostics: map[string]any{
@@ -150,7 +197,13 @@ func (s *Service) AskGlobal(ctx context.Context, in GlobalInput) (AskOutput, err
 			"mapCalls":     ans.Diagnostics.Global.MapCalls,
 			"reduceCalls":  ans.Diagnostics.Global.ReduceCalls,
 		},
-	}, nil
+	}
+	sid, err := s.persist(ctx, in.KBID, in.UserID, in.SessionID, in.Question, "global", out)
+	if err != nil {
+		return AskOutput{}, err
+	}
+	out.SessionID = sid
+	return out, nil
 }
 
 // AskDrift runs GraphRAG drift (global primer + local follow-up). No Citations.
@@ -177,7 +230,7 @@ func (s *Service) AskDrift(ctx context.Context, in DriftInput) (AskOutput, error
 	if err != nil {
 		return AskOutput{}, err
 	}
-	return AskOutput{
+	out := AskOutput{
 		Answer:    ans.Text,
 		Citations: []Citation{},
 		Diagnostics: map[string]any{
@@ -185,7 +238,13 @@ func (s *Service) AskDrift(ctx context.Context, in DriftInput) (AskOutput, error
 			"primerCommunityIds": ans.Diagnostics.Drift.PrimerCommunityIDs,
 			"rounds":             ans.Diagnostics.Drift.Rounds,
 		},
-	}, nil
+	}
+	sid, err := s.persist(ctx, in.KBID, in.UserID, in.SessionID, in.Question, "drift", out)
+	if err != nil {
+		return AskOutput{}, err
+	}
+	out.SessionID = sid
+	return out, nil
 }
 
 func truncate(s string, n int) string {

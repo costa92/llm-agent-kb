@@ -102,6 +102,54 @@ func TestRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+// fakeRecorder records the persistence calls.
+type fakeRecorder struct {
+	ensured  bool
+	appended bool
+	gotMode  string
+	sid      string
+}
+
+func (f *fakeRecorder) EnsureSession(ctx context.Context, kbID, userID, sessionID, firstQuestion string) (string, error) {
+	f.ensured = true
+	f.sid = "sess1"
+	return f.sid, nil
+}
+func (f *fakeRecorder) AppendPair(ctx context.Context, sessionID, question, answer string, citationsJSON []byte, mode string) error {
+	f.appended = true
+	f.gotMode = mode
+	return nil
+}
+
+func TestAskPersistsSession(t *testing.T) {
+	rec := &fakeRecorder{}
+	fake := &fakeRag{answer: ragcore.Answer{
+		Text: "the answer",
+		Hits: []ragstore.Hit{{Chunk: ragstore.StoredChunk{ID: "c1", Content: "snippet"}, Score: 0.9}},
+		Citations: []ragcore.Citation{{
+			ChunkID: "c1", DocID: "d1", Title: "Doc One", Score: 0.9,
+		}},
+		Diagnostics: ragcore.Diagnostics{HitCount: 1},
+	}}
+	svc := New(fake, Config{})
+	svc.SetRecorder(rec)
+	out, err := svc.Ask(context.Background(), AskInput{
+		Namespace: "kb_x", KBID: "x", UserID: "u1", Question: "fox?", Mode: "hybrid", TopK: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.SessionID != "sess1" {
+		t.Fatalf("SessionID = %q, want sess1", out.SessionID)
+	}
+	if !rec.ensured || !rec.appended {
+		t.Fatalf("recorder not called: ensured=%v appended=%v", rec.ensured, rec.appended)
+	}
+	if rec.gotMode != "hybrid" {
+		t.Fatalf("mode = %q", rec.gotMode)
+	}
+}
+
 func TestAskGlobalMapsDiagnostics(t *testing.T) {
 	fake := &fakeRag{globalAns: ragcore.Answer{
 		Text: "global answer",
