@@ -7,11 +7,19 @@ import (
 	"testing"
 
 	rageval "github.com/costa92/llm-agent-rag/eval"
+	raggenerate "github.com/costa92/llm-agent-rag/generate"
 	ragcore "github.com/costa92/llm-agent-rag/rag"
 	ragstore "github.com/costa92/llm-agent-rag/store"
 
 	"github.com/costa92/llm-agent-kb/internal/ragsvc"
 )
+
+// stubJudgeModel returns a fixed JSON judgement via the rag generate.Model seam.
+type stubJudgeModel struct{}
+
+func (stubJudgeModel) Generate(ctx context.Context, req raggenerate.Request) (raggenerate.Response, error) {
+	return raggenerate.Response{Text: `{"groundedness":1.0,"answer_relevance":1.0}`}, nil
+}
 
 // fakePort implements just the RagPort methods the adapters call.
 type fakePort struct {
@@ -113,6 +121,62 @@ func TestDriftViewNaNBecomesNull(t *testing.T) {
 	}
 	if !contains(s, `"histograms":[`) || !contains(s, `"l1Distance":2`) {
 		t.Fatalf("drift json missing histograms projection: %s", s)
+	}
+}
+
+func TestRunRetrieval(t *testing.T) {
+	port := fakePort{hits: []ragstore.Hit{{}}}
+	svc := NewService(port, stubJudgeModel{}, ServiceConfig{MaxAskTokens: 100, GlobalMaxCommunities: 4, DriftRounds: 1, DriftTopK: 3})
+	ds := rageval.Dataset{Name: "ds", TopK: 5, Examples: []rageval.Example{{Query: "q1", GoldDocIDs: []string{"d1"}}}}
+	res, err := svc.Run(context.Background(), RunRequest{KBID: "kb1", Namespace: "kb_kb1", Kind: KindRetrieval, Dataset: ds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Kind != KindRetrieval || res.Retrieval == nil {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if res.Retrieval.Examples != 1 {
+		t.Fatalf("examples = %d, want 1", res.Retrieval.Examples)
+	}
+}
+
+func TestRunTriad(t *testing.T) {
+	port := fakePort{answer: ragcore.Answer{Text: "a"}}
+	svc := NewService(port, stubJudgeModel{}, ServiceConfig{MaxAskTokens: 100})
+	ds := rageval.Dataset{Name: "ds", TopK: 5, Examples: []rageval.Example{{Query: "q1"}}}
+	res, err := svc.Run(context.Background(), RunRequest{KBID: "kb1", Namespace: "kb_kb1", Kind: KindTriad, Dataset: ds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Generation == nil || res.Generation.MeanGroundedness != 1.0 {
+		t.Fatalf("triad generation: %+v", res.Generation)
+	}
+}
+
+func TestRunRejectsUnknownKind(t *testing.T) {
+	svc := NewService(fakePort{}, stubJudgeModel{}, ServiceConfig{})
+	_, err := svc.Run(context.Background(), RunRequest{KBID: "kb1", Namespace: "kb_kb1", Kind: Kind("bogus"), Dataset: rageval.Dataset{TopK: 5}})
+	if err == nil {
+		t.Fatal("expected error for unknown kind")
+	}
+}
+
+func TestMarshalBaselineScrubsNaN(t *testing.T) {
+	curr := rageval.BenchmarkResult{
+		Dataset: rageval.AnswerDataset{Name: "ds", TopK: 5},
+		Metrics: rageval.BenchmarkMetrics{Examples: 1, MeanGroundedness: 0.8, MeanAnswerRelevance: 0.9, ExactMatch: math.NaN(), F1Token: math.NaN()},
+	}
+	raw, err := marshalBaseline(curr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Must re-decode cleanly (NaN scrubbed to 0).
+	var back rageval.BenchmarkResult
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("baseline must round-trip: %v (raw=%s)", err, raw)
+	}
+	if back.Metrics.MeanGroundedness != 0.8 {
+		t.Fatalf("groundedness lost: %+v", back.Metrics)
 	}
 }
 
