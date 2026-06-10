@@ -1,12 +1,60 @@
 package eval
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"testing"
 
 	rageval "github.com/costa92/llm-agent-rag/eval"
+	ragcore "github.com/costa92/llm-agent-rag/rag"
+	ragstore "github.com/costa92/llm-agent-rag/store"
+
+	"github.com/costa92/llm-agent-kb/internal/ragsvc"
 )
+
+// fakePort implements just the RagPort methods the adapters call.
+type fakePort struct {
+	hits   []ragstore.Hit
+	answer ragcore.Answer
+}
+
+func (f fakePort) Retrieve(ctx context.Context, q string, opts ragcore.SearchOptions) ([]ragstore.Hit, error) {
+	return f.hits, nil
+}
+func (f fakePort) Ask(ctx context.Context, q string, req ragsvc.AskRequest) (ragcore.Answer, error) {
+	return f.answer, nil
+}
+func (f fakePort) AskGlobal(ctx context.Context, q string, req ragsvc.GlobalRequest) (ragcore.Answer, error) {
+	return f.answer, nil
+}
+func (f fakePort) AskDrift(ctx context.Context, q string, req ragsvc.DriftRequest) (ragcore.Answer, error) {
+	return f.answer, nil
+}
+
+func TestRetrieverAdapterMapsOptions(t *testing.T) {
+	port := fakePort{hits: []ragstore.Hit{{}, {}}}
+	r := retrieverAdapter{port: port, namespace: "kb_x"}
+	hits, err := r.Retrieve(context.Background(), "q", ragcore.SearchOptions{TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("hits = %d, want 2", len(hits))
+	}
+}
+
+func TestAskerAdapterReturnsAnswer(t *testing.T) {
+	port := fakePort{answer: ragcore.Answer{Text: "hi"}}
+	a := askerAdapter{port: port, namespace: "kb_x", maxTokens: 100}
+	ans, err := a.Ask(context.Background(), "q", ragcore.AskOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ans.Text != "hi" {
+		t.Fatalf("answer = %q", ans.Text)
+	}
+}
 
 func TestRetrievalMetricsView(t *testing.T) {
 	m := rageval.Metrics{PrecisionAtK: 0.5, RecallAtK: 0.25, MRR: 0.75, GroundingAtK: 1.0, Examples: 4, TopK: 5}
